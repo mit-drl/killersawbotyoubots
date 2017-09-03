@@ -1,0 +1,8 @@
+digraph G {
+"map" -> "drc1"[label="Broadcaster: /mocap_to_tf\nAverage rate: 60.200 Hz\nMost recent transform: 1502653849.675 \nBuffer length: 4.967 sec\n"];
+"map" -> "drc1_arm"[label="Broadcaster: /mocap_to_tf\nAverage rate: 60.200 Hz\nMost recent transform: 1502653849.675 \nBuffer length: 4.967 sec\n"];
+"map" -> "drc3"[label="Broadcaster: /mocap_to_tf\nAverage rate: 60.200 Hz\nMost recent transform: 1502653849.675 \nBuffer length: 4.967 sec\n"];
+"map" -> "drc3_arm"[label="Broadcaster: /mocap_to_tf\nAverage rate: 60.199 Hz\nMost recent transform: 1502653849.675 \nBuffer length: 4.967 sec\n"];
+"map" -> "sawbot"[label="Broadcaster: /mocap_to_tf\nAverage rate: 60.199 Hz\nMost recent transform: 1502653849.676 \nBuffer length: 4.967 sec\n"];
+"base_footprint" -> "base_link"[label="Broadcaster: /drc3/footprint_link_tf\nAverage rate: 4.196 Hz\nMost recent transform: 1502653849.987 \nBuffer length: 4.767 sec\n"];
+}

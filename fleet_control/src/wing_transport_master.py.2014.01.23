@@ -1,0 +1,612 @@
+#!/usr/bin/env python
+
+## This node directs two robots transporting a wing skin from a start to
+## a goal location.  The start location is on a rack, and the goal is
+## mounted on the wing ladder.
+
+import roslib; roslib.load_manifest('fleet_control')
+from geometry_msgs.msg import Twist,Pose,PoseStamped,PointStamped
+from assembly_common.srv import BasePose,ArmCommand
+from mit_msgs.msg import MocapPositionArray
+from track_obj.msg import StartTracking
+from fleet_control.msg import Fleet
+from std_msgs.msg import String
+from brics_actuator.msg import JointVelocities
+import euclid
+import rospy
+import math
+
+import sys
+
+robot = ['drc3', 'drc1']
+
+pregrasp_radius = 1.05
+grasp_radius    = 0.3100 ## from hand to center
+
+tracker_topic = '/tracker_request'
+ack = None
+last_cmd = None #dict()
+fleet_origin = None
+
+rospy.init_node('wing_transport_master')
+
+from vicon_utils import *
+
+camera_robot = 'drc2'
+camera_poses = {
+    'away': ['/map', -1.494, 2.990, 0, 'arm_carry'],
+    'view_ladder': ['/ladder', -0.135, -1.682, 1.407, 'camera_pose']
+}
+
+XY_GAIN  = 1
+Z_GAIN   = 1
+ROT_GAIN = 2
+
+
+##################################################################
+
+
+# P-controller with bounded velocityhttp://imgur.com/gallery/RUpiPpd
+def get_vel(error, max_vel, gain):
+    error *= gain
+    if abs(error) > max_vel:
+        return math.copysign(max_vel, -error)
+    else:
+        return -error
+
+
+# P-controller with bounded velocity
+def get_multi_vel(error, max_vel, gain):
+    out = list()
+    ss = 0.0
+    if max_vel == 0.0:
+        return [ 0.0 for ii in error ]
+
+    for item in error:
+        out.append(-item * gain)
+        ss += item * item
+
+    ss = math.sqrt(ss)
+    #print "\tss: %f   max_vel: %f" % (ss, max_vel)
+    if ss > max_vel: 
+        out2 = list()
+        for item in out:
+            out2.append(item * max_vel / ss)
+        out = out2
+
+    #sys.stdout.write("GMV: ")
+    #for item in out:
+        #sys.stdout.write("%f " % item)
+    #sys.stdout.write("\n")
+
+    return out
+
+
+def get_fleet_origin_in_frame(frame):
+    global_fleet_pose = PoseStamped()
+    global_fleet_pose.header.frame_id = '/map'
+    global_fleet_pose.pose = fleet_origin
+    return transform_by_subjects(global_fleet_pose, frame)
+
+
+def from_frame_to_fleet_origin_frame(frame, twist):
+    local_fleet_pose = get_fleet_origin_in_frame(frame)
+    qt = euclid.Quaternion(local_fleet_pose.pose.orientation.w,
+                           local_fleet_pose.pose.orientation.x,
+                           local_fleet_pose.pose.orientation.y,
+                           local_fleet_pose.pose.orientation.z)
+    fleet_pitch, fleet_yaw, fleet_roll = qt.get_euler()
+    out = Twist()
+    sy = math.sin(fleet_yaw)
+    cy = math.cos(fleet_yaw)
+    out.linear.x =  cy * twist.linear.x + sy * twist.linear.y
+    out.linear.y = -sy * twist.linear.x + cy * twist.linear.y
+    out.linear.z = twist.linear.z
+    out.angular.z = twist.angular.z
+    # Assume roll and pitch are zero
+    return out
+
+
+def set_camera_pose(info):
+    frame, xx, yy, th, pose = info
+    camera_base_service(xx, yy, th, 0.03, 0.1, False, frame)
+    camera_arm_service(pose)
+
+
+def servo_fleet(target_pose, frame, lin_vel, ang_vel):
+    epsilon = 0.009
+
+    target_pose = geometry_pose_to_pose(target_pose)
+
+    while not rospy.is_shutdown():
+        if fleet_origin is None:
+            rospy.sleep(0.5)
+            continue
+
+        # get pose of fleet center and transform it
+        local_fleet_pose = get_fleet_origin_in_frame(frame)
+
+        dx = local_fleet_pose.pose.position.x - target_pose.trans.x
+        dy = local_fleet_pose.pose.position.y - target_pose.trans.y
+        dz = local_fleet_pose.pose.position.z - target_pose.trans.z
+        qt = euclid.Quaternion(local_fleet_pose.pose.orientation.w,
+                               local_fleet_pose.pose.orientation.x,
+                               local_fleet_pose.pose.orientation.y,
+                               local_fleet_pose.pose.orientation.z)
+        pitch, yaw, roll = qt.get_euler()
+        dyaw = normalize(yaw - target_pose.get_yaw())
+
+        done = True
+        if lin_vel > 0.0 and (abs(dx) > epsilon or abs(dy) > epsilon or abs(dz) > epsilon):
+            done = False
+        if ang_vel > 0.0 and abs(dyaw) > epsilon:
+            done = False
+
+        if done:
+            print 'Donions!'
+            break
+
+        twist = Twist()
+        twist.linear.x, twist.linear.y = get_multi_vel([dx, dy], lin_vel, XY_GAIN)
+        twist.linear.z = get_vel(dz, lin_vel, Z_GAIN)
+        twist.angular.z = get_vel(dyaw, ang_vel, ROT_GAIN)
+        #print "err: %f %f %f %f   cmd: %f %f %f %f" % (dx, dy, dz, dyaw, twist.linear.x, twist.linear.y, twist.linear.z, twist.angular.z)
+
+        # Now we have a command; must convert it to the fleet origin frame
+        twist = from_frame_to_fleet_origin_frame(frame, twist)
+        #print "\tin fof: %f %f" % (twist.linear.x, twist.linear.y)
+
+        fleet_vel.publish(twist)
+        rospy.sleep(0.01)
+
+    # send stop command
+    fleet_vel.publish(Twist())
+
+
+##################################################################
+
+def lift_wing_skin():
+    # Cartesian control via fleet control
+    pose = Pose()
+    pose.position.z = 0.05
+    pose.orientation.w = 1.0
+    frame = 'rack'
+    lin_vel = 0.05
+    ang_vel = 0.0
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+def lower_wing_skin():
+    # Fleet control command
+    pose = Pose() # Target is near origin
+    pose.position.z = 0.07
+    rot = Quaternion.new_rotate_euler(0, orig_fleet_yaw, 0)
+    pose.orientation.x = rot.x
+    pose.orientation.y = rot.y
+    pose.orientation.z = rot.z
+    pose.orientation.w = rot.w
+    frame = '/ladder'
+    lin_vel = 0.05
+    ang_vel = 0.05
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+
+def rotate_to_face_ladder():
+    # Fleet control command
+    global orig_robot0, orig_fleet_yaw
+
+    ps = PointStamped()
+    ps.header.frame_id = '/ladder'
+    ps = transform_by_subjects(ps, '/rack')
+    ladder = math.atan2(ps.point.y, ps.point.x) 
+
+    ps = PointStamped()
+    ps.header.frame_id = '/' + robot[0]
+    ps = transform_by_subjects(ps, '/rack')
+    robot0 = math.atan2(ps.point.y, ps.point.x) 
+    orig_robot0 = robot0
+
+    local_fleet_pose = get_fleet_origin_in_frame('/rack')
+    qt = euclid.Quaternion(local_fleet_pose.pose.orientation.w,
+                           local_fleet_pose.pose.orientation.x,
+                           local_fleet_pose.pose.orientation.y,
+                           local_fleet_pose.pose.orientation.z)
+    fleet_pitch, fleet_yaw, fleet_roll = qt.get_euler()
+    orig_fleet_yaw = fleet_yaw
+
+    dth0 = normalize(ladder - (robot0 + 0.5 * math.pi) + fleet_yaw)
+    dth1 = normalize(ladder - (robot0 - 0.5 * math.pi) + fleet_yaw)
+
+    dyaw = dth0 if abs(normalize(dth0-fleet_yaw)) < abs(normalize(dth1-fleet_yaw)) else dth1
+    # dyaw = dth0 if abs(dth0) < abs(dth1) else dth1
+    #print "dyaw: %f   ladder: %f   robot0: %f   fleet_yaw: %f" % (dyaw, ladder, robot0, fleet_yaw)
+    qt = Quaternion.new_rotate_euler(0.0, dyaw, 0.0)
+
+    pose = Pose()
+    pose.orientation.x = qt.x
+    pose.orientation.y = qt.y
+    pose.orientation.z = qt.z
+    pose.orientation.w = qt.w
+    frame = '/rack'
+    lin_vel = 0.0
+    ang_vel = 0.2
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+def translate_to_ladder():
+    # Fleet control command
+    pose = Pose()
+    pose.position.z = 0.16
+    pose.orientation.w = 1.0
+    frame = '/map'
+    lin_vel = 0.1
+    ang_vel = 0.0
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+def rotate_into_ladder_alignment():
+    # Fleet control command
+    ps = PointStamped()
+    ps.header.frame_id = '/' + robot[0]
+    ps = transform_by_subjects(ps, '/ladder')
+    robot0 = math.atan2(ps.point.y, ps.point.x) 
+
+    dyaw = orig_robot0 - robot0
+
+    local_fleet_pose = get_fleet_origin_in_frame('/ladder')
+    qt = euclid.Quaternion(local_fleet_pose.pose.orientation.w,
+                           local_fleet_pose.pose.orientation.x,
+                           local_fleet_pose.pose.orientation.y,
+                           local_fleet_pose.pose.orientation.z)
+    fleet_pitch, fleet_yaw, fleet_roll = qt.get_euler()
+    #print "dyaw: %f = %f - %f" % (dyaw, orig_robot0, robot0)
+    #print "yaw: %f = %f - %f" % (dyaw - fleet_yaw, dyaw, fleet_yaw)
+    qt = Quaternion.new_rotate_euler(0.0, dyaw + fleet_yaw, 0.0)
+    #qt = Quaternion.new_rotate_euler(fleet_pitch, -fleet_yaw, fleet_roll)
+
+    pose = Pose() # Target is origin (rotation only)
+    pose.orientation.x = qt.x
+    pose.orientation.y = qt.y
+    pose.orientation.z = qt.z
+    pose.orientation.w = qt.w
+    frame = '/ladder'
+    lin_vel = 0.0
+    ang_vel = 0.2
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+
+def move_camera_robot_to_side():
+    set_camera_pose(camera_poses['away'])
+
+
+def move_to_camera_pose():
+    set_camera_pose(camera_poses['view_ladder'])
+
+
+def start_visual_tracking():
+    # Visual tracker command
+    msg = StartTracking()
+    msg.object_name = 'wing_skin_upper'
+
+    # Have fleet origin pose; need to compute wing skin pose from it
+    pose = geometry_pose_to_pose(fleet_origin)
+    rot = Quaternion.new_rotate_euler(0, -orig_fleet_yaw, 0)
+    pose.rot *= rot
+    msg.pose_estimate = pose_to_geometry_pose(pose)
+    tracker_pub.publish(msg)
+
+
+def stop_visual_tracking():
+    # Visual tracker command
+    msg = StartTracking() # Empty object_name means stop tracking
+
+    ## NOTE: keep this -- commented out for demo
+    #tracker_pub.publish(msg)
+
+
+def visual_servo_alignment():
+    # Doesn't exist yet?  Part feedback?
+    pass
+
+
+def establish_fleet_formation():
+    fleet = Fleet()
+    fleet.group.extend(robot)
+    set_fleet.publish(fleet)
+    origin = PoseStamped()
+    origin.header.frame_id = '/map'
+    origin.pose = vicon_to_geometry_pose('rack')
+    transform_origin_pub.publish(origin)
+
+#def establish_fleet_formation_2():
+#    fleet = Fleet()
+#    fleet.group.extend(robot)
+#    set_fleet.publish(fleet)
+#    origin = PoseStamped()
+#    origin.header.frame_id = '/map'
+#    origin.pose = vicon_to_geometry_pose('ladder')
+#    transform_origin_pub.publish(origin)
+
+def establish_fleet_formation_2():
+    fleet = Fleet()
+    fleet.group.extend(robot)
+    set_fleet.publish(fleet)
+    origin = PoseStamped()
+    origin.header.frame_id = '/map'
+    origin.pose = vicon_to_geometry_pose('drc4_arm')
+    transform_origin_pub.publish(origin)
+    
+def move_to_hole_guess():
+    # Fleet control command
+    pose = Pose()
+    pose.position.z = 0.16
+    pose.orientation.w = 1.0
+    frame = '/drc4_arm'
+    lin_vel = 0.1
+    ang_vel = 0.0
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+    
+    
+def fleet_search():
+    pass #TODO
+
+def translate_to_drc4():
+    # Fleet control command
+    pose = Pose()
+    pose.position.z = 0.16
+    pose.orientation.w = 1.0
+    frame = '/map'
+    lin_vel = 0.1
+    ang_vel = 0.0
+    pose.position.x = 0.01
+    servo_fleet(pose, frame, lin_vel, ang_vel)
+
+
+def break_fleet_formation():
+    fleet = Fleet() # Empty fleet means break formation
+    set_fleet.publish(fleet)
+
+
+###########################################################
+
+
+def handle_fleet_origin(msg):
+    global fleet_origin
+    fleet_origin = msg
+
+
+class Callback:
+    def __init__(self, robot):
+        self.robot = robot
+        self.ack = False
+
+    def callback(self, msg):
+        global last_cmd
+        if msg.data == last_cmd:
+            print "Got ack %s for robot %s" % (msg.data, self.robot)
+            self.ack = True
+
+    def init_ack(self):
+        self.ack = False
+
+
+class AckHandler:
+    def __init__(self, robots):
+        self.robots = robots
+        self.callback = dict()
+        for rr in robots:
+            self.callback[rr] = Callback(rr)
+
+    def init_acks(self):
+        global last_cmd
+        print "Given new command %s" % (last_cmd)
+        for rr in self.robots:
+            #print self.callback[rr]
+            self.callback[rr].init_ack()
+
+    def wait_for_all_acks(self):
+        global last_cmd
+        while not rospy.is_shutdown():
+            done = True
+            for rr in self.robots:
+                if False == self.callback[rr].ack:
+                    print "Missing ack %s for robot %s" % (last_cmd, rr)
+                    done = False
+                    break
+            if done:
+                break
+            rospy.sleep(0.5)
+
+
+def distributed_cmd(cmd, speech=None, pause=False):
+    global last_cmd
+    # Send command
+    print "DISTRIBUTED %s" % (cmd)
+    if speech is not None:
+        text_to_speech[robot[0]].publish(speech)
+    last_cmd = cmd
+    ack.init_acks()
+    for rr in robot:
+        msg = String()
+        msg.data = cmd
+        pub[rr].publish(msg)
+
+    # Wait for replies
+    ack.wait_for_all_acks()
+
+    if pause:
+        print("Press return to continue.")
+        raw_input("Done.\n")
+
+
+def distributed_base_cmd(base_cmd, angle0, radius, speech=None, pause=False):
+    # Add args to the command giving base position and orientation,
+    # which must be different for each robot.  The robots are assumed
+    # to form a circle in the target reference frame, each pointing
+    # toward the frame origin.  The first robot is located at a heading
+    # angle0 with respect to the target frame.
+
+    global last_cmd
+
+    print "DISTRIBUTED BASE %s" % (base_cmd)
+
+    if speech is not None:
+        text_to_speech[robot[0]].publish(speech)
+
+    angle = angle0
+    angle_incr = 2.0 * math.pi / len(robot)
+    last_cmd = base_cmd
+    ack.init_acks()
+
+    for rr in robot:
+        xx = radius * math.cos(angle)
+        yy = radius * math.sin(angle)
+        theta = math.pi + angle
+        cmd = '%s %f %f %f' % (base_cmd, xx, yy, theta)
+
+        msg = String()
+        msg.data = cmd
+        pub[rr].publish(msg)
+
+        angle += angle_incr
+
+    # Wait for replies
+    ack.wait_for_all_acks()
+
+    if pause:
+        print("Press return to continue.")
+        raw_input("Done.\n")
+
+
+cmds = { 'lift_wing_skin': lift_wing_skin,
+         'lower_wing_skin': lower_wing_skin,
+         'rotate_to_face_ladder': rotate_to_face_ladder,
+         'translate_to_ladder': translate_to_ladder,
+         'rotate_into_ladder_alignment': rotate_into_ladder_alignment,
+         'move_camera_robot_to_side': move_camera_robot_to_side,
+         'move_to_camera_pose': move_to_camera_pose,
+         'start_visual_tracking': start_visual_tracking,
+         'visual_servo_alignment': visual_servo_alignment,
+         'stop_visual_tracking': stop_visual_tracking,
+         'establish_fleet_formation': establish_fleet_formation,
+         'break_fleet_formation': break_fleet_formation,
+         'establish_fleet_formation_2' : establish_fleet_formation_2,
+         'move_to_hole_guess' : move_to_hole_guess,
+         'fleet_search' : fleet_search}
+
+
+def centralized_cmd(cmd, speech=None, pause=False):
+    print "CENTRALIZED command: %s" % cmd
+    if speech is not None:
+        text_to_speech[robot[0]].publish(speech)
+    cmds[cmd]()
+
+    if pause:
+        print("Press return to continue.")
+        raw_input("Done.\n")
+
+
+# Step 0) Initialization
+ack = AckHandler(robot)
+pub = dict()
+sub = dict()
+stop = dict()
+text_to_speech = dict()
+last_cmd = 'init'
+ack.init_acks() # TODO: There is a race condition: this might run second, thus wait forever
+for rr in robot:
+    pub_topic = '/' + rr + '/wing_transport_request'
+    sub_topic = '/' + rr + '/wing_transport_reply'
+    speech_topic = '/' + rr + '/text_to_speech'
+    stop_topic = '/' + rr + '/arm_1/arm_controller/velocity_command'
+    # TODO: rr is lazily evaluated in lambda, so this shouldn't work!
+    sub[rr] = rospy.Subscriber(sub_topic, String, ack.callback[rr].callback)
+    pub[rr] = rospy.Publisher(pub_topic, String)
+    stop[rr] = rospy.Publisher(stop_topic, JointVelocities)
+    text_to_speech[rr] = rospy.Publisher(speech_topic, String)
+
+# For camera robot
+camera_base_service = rospy.ServiceProxy('/' + camera_robot + '/robot_base_command', BasePose)
+camera_arm_service  = rospy.ServiceProxy('/' + camera_robot + '/robot_arm_command', ArmCommand)
+
+
+tracker_topic = '/tracker_request'
+set_fleet_topic = '/set_fleet' 
+fleet_vel_topic = '/multi_cmd'
+transform_origin_topic = '/transform_origin'
+fleet_origin_topic  = '/fleet_origin'
+tracker_pub = rospy.Publisher(tracker_topic, StartTracking, latch=True)
+set_fleet = rospy.Publisher(set_fleet_topic, Fleet, latch=True)
+fleet_vel = rospy.Publisher(fleet_vel_topic, Twist, latch=False)
+transform_origin_pub = rospy.Publisher(transform_origin_topic, PoseStamped, latch=True)
+fleet_origin_sub = rospy.Subscriber(fleet_origin_topic, Pose, handle_fleet_origin)
+
+ack.wait_for_all_acks()
+print "Finished pub/sub"
+
+#TODO: Andy new sequence of comamnds
+distributed_base_cmd('establish_fleet_formation_2')
+distributed_base_cmd('fleet_search')
+
+
+
+# Step 1) Go to rack.
+#TODO: uncomment out when camera robot is needed
+#centralized_cmd('move_camera_robot_to_side', 'Move into position')
+
+#TODO: temporary
+
+raw_input("Got to rack")
+distributed_base_cmd('go_to_rack', 0.0, pregrasp_radius)
+raw_input("Open gripper")
+distributed_cmd('grasp_wing_pose')
+raw_input("Close gripper")
+distributed_cmd('close_gripper')
+raw_input("Get the formation")
+centralized_cmd('establish_fleet_formation')
+raw_input("Activate the search!")
+
+
+distributed_base_cmd('go_to_rack', 0.0, pregrasp_radius)
+
+# Step 2) Grasp the wing skin.
+distributed_cmd('grasp_wing_pose', pause=True)
+distributed_base_cmd('arm_feedback_to_grasp_wing', 0.0, grasp_radius)
+distributed_cmd('close_gripper')
+
+# Step 3) Establish a fleet formation.
+
+centralized_cmd('establish_fleet_formation')
+
+# Step 4) Lift the wing skin.
+centralized_cmd('lift_wing_skin', 'Transport the wing skin.')
+
+# Step 5) Transport the wing skin.  Must avoid obstacles.
+centralized_cmd('rotate_to_face_ladder')
+centralized_cmd('translate_to_ladder')
+centralized_cmd('rotate_into_ladder_alignment')
+
+# Step 6) Position the wing skin over the wing ladder.
+#TODO: uncomment out when camera robot is needed
+#centralized_cmd('move_to_camera_pose', 'Activate camera for precise alignment')
+#centralized_cmd('start_visual_tracking', pause=True)
+#centralized_cmd('visual_servo_alignment')
+#centralized_cmd('stop_visual_tracking')
+
+# Step 7) Lower the wing skin onto the ladder.
+centralized_cmd('lower_wing_skin')
+
+# Step 8) Break the fleet formation.
+centralized_cmd('break_fleet_formation')
+
+# Step 9) Release the wing skin.
+distributed_cmd('open_gripper')
+
+# Step 10) Back away.
+distributed_cmd('back_away')
+
+rospy.spin()
+
+

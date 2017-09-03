@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import roslib; roslib.load_manifest('fleet_control')
+import rospy
+import numpy as np
+import openravepy as orpy
+import re
+import time
+from brics_actuator.msg import JointPositions, JointValue
+from geometry_msgs.msg import Pose
+
+import IPython
+import threading
+import sys
+from geometry_msgs.msg import Twist
+ipshell = IPython.embed 
+
+
+
+
+
+
+class IkController:
+    
+    
+    def updatePositions(self, jp):
+        self.sem.acquire()
+        for ji in range(5):
+            self.cur_pos[ji] = jp.positions[ji].value
+            
+        self.sem.release()
+
+    def convert_to_np(self, vec):
+        return np.array([vec.x, vec.y, vec.z])
+
+    def handle_command(self, msg):
+        print 'got command'
+    
+    #TODO: servo fleet can just send the same goal and velocity over and over
+    
+     #TODO: convert this then to just go to that current step with small loop increments
+     #increment sizes based off velocity
+     #This doesn't loop - just makes one quick decision.
+    
+        target = self.convert_to_np(msg.linear)
+        direction = self.convert_to_np(msg.angular)
+        
+        self.sem.acquire()
+        current = self.cur_pos.copy()
+        self.sem.release()
+        
+        #Now that we have the current position and the target, let's do our inverse kinematics thing
+        
+        zstep = 0.001
+        prevtarget = None
+        
+        # Find a solution to the target
+        
+        solution = self.manip.FindIKSolution(orpy.IkParameterization(orpy.Ray(target,direction),orpy.IkParameterization.Type.TranslationDirection5D),orpy.IkFilterOptions.CheckEnvCollisions)
+        if solution is None:
+            print "Can't move!"
+            return
+                
+       
+        
+        #for q in path:
+        #And finally, let's execute:
+        
+        self.robot.SetDOFValues(solution, self.manip.GetArmIndices())
+        positions = self.convert_to_real_youbot_joint_values(solution)
+        print positions
+        print type(positions)
+        jp = JointPositions()
+        jp.positions = [JointValue() for i in range(5)]
+        #print jp.positions
+        now = rospy.get_rostime()
+        for ji in range(5):
+            jp.positions[ji].timeStamp = now
+            jp.positions[ji].joint_uri = 'arm_joint_' + str(ji + 1)
+            jp.positions[ji].unit = 'rad'
+            jp.positions[ji].value = positions[ji]
+            
+            #print jp.positions[ji].value
+            print jp
+        
+        #print jp
+        pub.publish(jp)
+        time.sleep(0.2)
+            
+            
+        
+        
+        
+        
+    
+    def __init__(self, pub):
+        np.set_printoptions(suppress=True)
+        np.set_printoptions(precision=4)
+
+        self.pub = pub
+        self.env = orpy.Environment() # create openrave environment
+        self.env.SetViewer('qtcoin') # attach viewer (optional)
+        self.env.Load(path + '/robots/kuka-youbot.robot.xml') 
+        self.robot = self.env.GetRobots()[0]
+        print 'robot is'
+        print self.robot
+        self.manip = self.robot.GetManipulators()[0]
+        print 'manip is'
+        print self.manip
+        
+        with self.robot.GetEnv():
+            self.robot.SetActiveManipulator(self.manip)
+            self.manip.ik_database = orpy.databases.inversekinematics.InverseKinematicsModel(self.robot, iktype=orpy.IkParameterization.Type.TranslationDirection5D)
+            if not self.manip.ik_database.load():
+                print 'Generating IK database for %s.'%self.manip.GetName()
+                self.manip.ik_database.autogenerate()
+                
+        self.cur_pos = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+        self.sem = threading.Semaphore()
+        print 'finished constructor'
+                
+        
+        
+
+    def convert_to_real_youbot_joint_values(self, q):
+        jointdiff = np.array([2.949606435870417,
+                                   1.1344640137963142,
+                                  -2.548180707911721,
+                                  1.7889624832941877,
+                                  2.923426497090502])
+        return jointdiff + q
+        
+        
+        
+path = ''
+
+
+if len(sys.argv) < 2:
+    print "Usage: youbot_ik.py <model_location>"
+else:
+    path = sys.argv[1]
+rospy.init_node('ik')
+print 'init node'
+my_name = re.sub(r'/', r'', rospy.get_namespace())
+out_command_topic = my_name + '/arm_1/arm_controller/position_command'
+in_command_topic = my_name + '/ik_arm_command'
+print out_command_topic
+print in_command_topic
+pub = rospy.Publisher(out_command_topic, JointPositions)
+print 'inited publisher'
+ik = IkController(pub)
+print 'inited constructor'
+joint_states_topic = my_name + '/joint_states'
+rospy.Subscriber(in_command_topic, Twist, ik.handle_command) #TODO: change name
+rospy.Subscriber(joint_states_topic,  JointPositions, ik.updatePositions) 
+print 'done initializing!'
+rospy.spin()
+

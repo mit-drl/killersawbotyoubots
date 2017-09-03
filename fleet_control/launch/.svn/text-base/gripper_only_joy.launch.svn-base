@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<launch>
+	<node name="joy" pkg="joy" type="joy_node" />
+
+	<node name="gripper_only_joy" pkg="fleet_control"
+	      args="drc3 drc4"
+	      type="gripper_only_joy.py" output="screen" />
+</launch>

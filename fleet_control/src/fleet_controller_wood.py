@@ -1,0 +1,647 @@
+#!/usr/bin/env python
+
+## This node runs on each robot participating in coordinated fleet control.
+
+import roslib; roslib.load_manifest('fleet_control')
+
+from youbotpy import YoubotEnv
+import openravepy as orpy
+
+from assembly_common.msg import TrackCartesian
+from geometry_msgs.msg import PoseStamped,Twist,Pose
+from fleet_control.msg import Fleet,FleetDebug,FleetCommand
+from mit_msgs.msg import MocapPositionArray
+from euclid import *
+from std_msgs.msg import Float64
+import threading
+import rospy
+import copy
+import math
+import sys
+import re
+import time
+import numpy as np
+
+rospy.init_node('fleet_controller')
+
+from vicon_utils import *
+
+
+BASE_CMD_TOPIC = "cmd_vel"
+CMD_TIMEOUT = 0.1
+FORMATION_GAIN = 0.2 #1.0
+FORMATION_GAIN_Z = 0.3 #0 #0.4
+FORMATION_GAIN_W = 0.2 #1.0
+STABILITY_GAIN = 0 #4.0
+STABILITY_GAIN_Z = 0 #0.4
+STABILITY_GAIN_W = 0 #1.0
+LIN_GAIN = 0.80
+ROT_GAIN = 0.40
+DEAD_ZONE = 0.01 # meters
+
+FORCE_SCALE = 0.0001
+MAX_DISTANCE_OFFSET = 0.01 #never back up more than a centimeter in each time step
+MIN_FORCE_THRESH = -20 #N*m
+MAX_DISPLACEMENT = 0.10
+MAX_COMPONENT = 0.20
+
+extra_displacement = 0
+max_force = -999999999999
+min_force = 999999999999
+
+
+watch_list = []
+arms_list = []
+origin = None # origin of the formation in the body frame
+want_pose = None # Desired mean_pose
+#want_inv = None
+my_name = None
+my_frame = None
+arm_frame = None
+saved_global_target = None
+
+
+def set_transform_origin(new_origin):
+    global origin
+    origin = new_origin
+
+
+def global_frame_to_body_frame(pose):
+    if isinstance(pose, PoseStamped):
+        pose = geometry_pose_to_pose(pose.pose)
+    elif isinstance(pose, Pose):
+        pose = geometry_pose_to_pose(pose)
+
+    backward = Pose3.new_from_matrix(get_subject_transform(my_frame))
+    (pp, yy, rr) = backward.rot.get_euler()
+    backward.rot = Quaternion.new_rotate_euler(0.0, yy, 0.0)
+    return backward.get_matrix().inverse() * pose
+
+
+def arm_frame_to_global_frame(pose):
+    if isinstance(pose, PoseStamped):
+        pose = geometry_pose_to_pose(pose.pose)
+    elif isinstance(pose, Pose):
+        pose = geometry_pose_to_pose(pose)
+
+    arm = Pose3.new_from_matrix(get_subject_transform(arm_frame))
+    forward = Pose3.new_from_matrix(get_subject_transform(my_frame))
+    forward.trans.z = arm.trans.z
+    (pp, yy, rr) = forward.rot.get_euler()
+    forward.rot = Quaternion.new_rotate_euler(0.0, yy, 0.0)
+    return forward * pose
+
+
+def global_frame_to_arm_frame(pose):
+    if isinstance(pose, PoseStamped):
+        pose = geometry_pose_to_pose(pose.pose)
+    elif isinstance(pose, Pose):
+        pose = geometry_pose_to_pose(pose)
+
+    arm = Pose3.new_from_matrix(get_subject_transform(arm_frame))
+    backward = Pose3.new_from_matrix(get_subject_transform(my_frame))
+    backward.trans.z = arm.trans.z
+    (pp, yy, rr) = backward.rot.get_euler()
+    backward.rot = Quaternion.new_rotate_euler(0.0, yy, 0.0)
+    return backward.get_matrix().inverse() * pose
+
+
+def body_frame_to_global_frame(pose):
+    if isinstance(pose, PoseStamped):
+        pose = geometry_pose_to_pose(pose.pose)
+    elif isinstance(pose, Pose):
+        pose = geometry_pose_to_pose(pose)
+
+    forward = Pose3.new_from_matrix(get_subject_transform(my_frame))
+    (pp, yy, rr) = forward.rot.get_euler()
+    forward.rot = Quaternion.new_rotate_euler(0.0, yy, 0.0)
+    return forward * pose
+
+
+# This function returns the pose of a frame which has its origin at the
+# midpoint of all the bodies and which has a yaw such that the frame is aligned
+# with the vector from the current robot arm to the midpoint. This frame is
+# represented in another frame which has its origin at the arm, but which has
+# the orientation of the body frame.
+def get_mean_pose(names):
+    global all_subjects, arm_name
+    print 'all_subjects is', all_subjects
+    print 'names is ', names
+    if len(all_subjects) == 0 or len(names) == 0:
+        return None
+
+    #print "GMP: %d names: %s" % (len(names), names)
+
+    my_arm_pose = None
+
+    sumpt = Point3()
+    for name in names:
+        mp = get_subject(name)
+        pose = get_pose(mp)
+        #print "\t%s: got pose %s: %f %f %f" % (my_name, name, pose.trans.x, pose.trans.y, pose.trans.z)
+        sumpt += pose.trans
+        #print "\t%s %s %s" % (my_name, name, pose.trans)
+
+    for ii in range(3):
+        sumpt[ii] /= len(names)
+
+    yaw = math.atan2(sumpt.y - pose.trans.y, sumpt.x - pose.trans.x)
+
+    ## Convert average pose in global frame into robot frame
+    assert(isinstance(sumpt, Point3))
+    pose = Pose3().new_pose(sumpt, Quaternion().new_rotate_euler(0.0, yaw, 0.0))
+
+    ## Do the transform "by hand" so we can null out pitch and roll.
+    ## This is important to judge z values correctly in the body frame.
+    #ps = PoseStamped()
+    #ps.pose = pose_to_geometry_pose(pose)
+    #ps.header.frame_id = '/map'
+    pose = global_frame_to_body_frame(pose)
+    #print "\t\t%s: sumpt in body %s" % (my_name, pose.trans)
+    #ps = transform_by_subjects(ps, my_frame)
+    #print "\t\t%s: sumpt body trans: %s" % (my_name, geometry_pose_to_pose(ps.pose))
+    #print "\t%s %s %f" % (my_name, tmp_pose.trans, tmp_pose.get_yaw())
+    body = vicon_to_geometry_pose(my_frame)
+    #if my_name == 'drc3':
+    #print "\t\t%s: mean pose z: %f - %f + %f => %f" % (my_name, pose.trans.z, my_arm_pose.trans.z, body.position.z, pose.trans.z - my_arm_pose.trans.z + body.position.z)
+    #return Pose3().new_pose(Point3(ps.position.x, ps.position.y,
+    #                               ps.position.z - my_arm_pose.trans.z + body.position.z),
+    #                        Quaternion(ps.orientation.w,
+    #                                   ps.orientation.x,
+    #                                   ps.orientation.y,
+    #                                   ps.orientation.z))
+    
+    #pose.trans.x -= arm.trans.x
+    #pose.trans.y -= arm.trans.y
+    #pose.trans.z += body.position.z - my_arm_pose.trans.z
+
+    return pose
+
+
+## TODO: delete this; it produces incorrect results (two different notions of what is target)
+#def compute_target_pose(msg):
+#    global saved_global_target
+#    if saved_global_target is None or abs(msg.angular.x) > 1e-4 or abs(msg.angular.y) > 1e-4 or abs(msg.angular.z) > 1e-4:
+#        saved_global_target = body_frame_to_global_frame(want_pose)
+#        return want_pose
+#
+#    ## Assumes global Z is local Z
+#    pose = global_frame_to_body_frame(saved_global_target)
+#    if abs(msg.linear.x) > 1e-4 or abs(msg.linear.y) > 1e-4:
+#        pose.trans.x = want_pose.trans.x
+#        pose.trans.y = want_pose.trans.y
+#        print "%s: Update x target to %f" % (my_name, pose.trans.x)
+#        print "%s: Update y target to %f" % (my_name, pose.trans.y)
+#    if abs(msg.linear.z) > 1e-4:
+#        pose.trans.z = want_pose.trans.z
+#        print "%s: Update z target to %f" % (my_name, pose.trans.z)
+#    saved_global_target = body_frame_to_global_frame(pose)
+#
+#    print "%s: save: %s" % (my_name, pose)
+#    print "%s: want: %s" % (my_name, want_pose)
+#
+#    return pose
+
+
+def compute_formation_correction(msg, actual_pose):
+    global saved_global_target
+    #print "%s: actual: %s" % (my_name, actual_pose)
+    #print "%s: want: %s" % (my_name, want_pose)
+    #add_pose_to_fleet_debug(actual_pose)
+    #add_pose_to_fleet_debug(want_pose)
+    dth = normalize(actual_pose.get_yaw() - want_pose.get_yaw())
+
+
+    #ANDY EDIT: added additional movement backwards in x proportional to the force
+    global youbotenv
+    global myname_bare
+    global extra_displacement
+    global max_force
+    global min_force
+    
+    force = youbotenv.GetEndEffectorForces(myname_bare)
+    
+    if force[0] < 40 and force[0] > -50:
+        fdistance = 0
+    else:
+        fdistance = force[0] * FORCE_SCALE
+    
+    if fdistance > MAX_DISTANCE_OFFSET:
+        fdistance = MAX_DISTANCE_OFFSET
+    
+    extra_displacement += fdistance
+
+    if force[0] > max_force:
+        max_force = force[0]
+    if force[0] < min_force:
+        min_force = force[0] 
+            
+    #if math.fabs(extra_displacement) < MAX_DISPLACEMENT: #if we can still move       
+    #    pass
+    #    #want_pose.trans.x -= fdistance
+    #else:
+    #    print 'EXCEEDED MAXIMUM!!!!!'
+    #    print my_name + ' ' + str(extra_displacement)
+    #
+
+    #print '%s force is %f' % (my_name, force[0])
+    #print '%s distance is is %f' % (my_name, fdistance)
+    #print '%s max_force is %f' % (my_name, max_force)
+    #print '%s min_force is %f' % (my_name, min_force)
+
+    force_topic_x.publish(Float64(data=force[0]))
+    force_topic_z.publish(Float64(data=force[1]))
+    
+ 
+    dd = actual_pose.trans - want_pose.trans 
+
+    #Mehmet added this to level two hands
+    dd.z = actual_pose.trans.z
+    
+
+    
+    #print "%s: actual_pose.trans: %f %f %f" % (my_name, actual_pose.trans.x, actual_pose.trans.y, actual_pose.trans.z)
+    #print "%s: want_pose.trans: %f %f %f" % (my_name, want_pose.trans.x, want_pose.trans.y, want_pose.trans.z)
+    #print "%s: actual_pose_yaw: %f, want_pose_yaw: %f" % (my_name, actual_pose.get_yaw(), want_pose.get_yaw())
+    assert(isinstance(dd,Vector3))
+    return (dd, dth)
+
+
+def compute_stability_correction(msg, actual_pose):
+    global saved_global_target
+    if saved_global_target is None or abs(msg.angular.x) > 1e-4 or abs(msg.angular.y) > 1e-4 or abs(msg.angular.z) > 1e-4:
+        saved_global_target = body_frame_to_global_frame(want_pose)
+        #print "%s: saved RESET to want" % (my_name)
+        return (Vector3(), 0.0)
+
+    ## NOTE: Assumes global Z is local Z
+    saved_local_pose = global_frame_to_body_frame(saved_global_target)
+    dd = saved_local_pose.trans - actual_pose.trans
+    updated = False
+    saved_local_pose = global_frame_to_body_frame(saved_global_target)
+    if abs(msg.linear.x) > 1e-4 or abs(msg.linear.y) > 1e-4:
+        saved_local_pose.trans.x = want_pose.trans.x
+        saved_local_pose.trans.y = want_pose.trans.y
+        dd.x = dd.y = 0.0
+        updated = True
+    if abs(msg.linear.z) > 1e-4:
+        saved_local_pose.trans.z = want_pose.trans.z
+        dd.z = 0.0
+        updated = True
+
+    if updated:
+        #print "%s: saved: %s" % (my_name, saved_local_pose)
+        saved_global_target = body_frame_to_global_frame(saved_local_pose)
+    #else:
+        #print "%s: saved: NOT UPDATED %s" % (my_name, saved_local_pose)
+
+    #print "%s: save: %s" % (my_name, saved_local_pose)
+    #print "%s: want: %s" % (my_name, want_pose)
+
+    return (dd, 0.0)
+
+
+def add_pose_to_fleet_debug(pose):
+    global fleet_debug
+    fleet_debug.data.append(pose.trans.x)
+    fleet_debug.data.append(pose.trans.y)
+    fleet_debug.data.append(pose.trans.z)
+
+
+def compute_grasp_correction():
+    #arm = get_subject_transform(arm_frame)
+    ## arm.k is the hand's z axis projected to world z. 
+    ## world z points up.
+    ## hand z is normal to the palm, but directed into the palm, not out.
+    #ee_angular_deviation = math.asin(arm.k)
+    ##print my_name,' grasp correction deviation: ',-1.0*ee_angular_deviation
+    #return -1.0*ee_angular_deviation
+    
+    # Now using openrave robot
+    ee_angular_deviation = math.asin(robot.GetManipulators()[0].GetEndEffectorTransform()[2,2])
+    return ee_angular_deviation
+
+def transform_cmd_to_base_and_arm(msg):
+    global fleet_debug
+    fleet_debug = FleetDebug()
+    base_cmd = Twist()
+    arm_cmd = TrackCartesian()
+
+    # Get my pose in the mean frame
+    #actual_pose = get_mean_pose(arms_list)
+    
+    #Andy change
+    actual_pose = get_mean_pose(watch_list)
+    
+    if actual_pose is None or origin is None:
+        print 'actual pose is ', actual_pose
+        print 'origin is ', origin
+        return None, None # zero robots in fleet
+    #inv = Pose3().new_from_matrix(mean_pose.get_matrix().inverse())
+
+    my_pose = get_pose(get_subject(my_name))
+    
+    
+    
+
+    # Command term; issued in fleet origin frame to control actual_pose center
+    angle = origin.get_yaw()
+    ca = math.cos(angle)
+    sa = math.sin(angle)
+    dx  = LIN_GAIN * (ca * msg.linear.x - sa * msg.linear.y)
+    dy  = LIN_GAIN * (ca * msg.linear.y + sa * msg.linear.x)
+    dz  = LIN_GAIN * msg.linear.z
+    dth = ROT_GAIN * msg.angular.z
+
+    # Convert back to my own command frame
+    angle = math.atan2(origin.trans.y, origin.trans.x) - 0.5 * math.pi
+
+    # Rotation around a remote point (origin) causes some translation too
+    theta = my_pose.get_yaw()
+    sth = math.sin(theta)
+    cth = math.cos(theta)
+    #Andy change
+    #dist = math.hypot(origin.trans.y, origin.trans.x) + np.linalg.norm(robot.GetManipulators()[0].GetEndEffectorTransform()[:2,3]-robot.GetTransform()[:2,3])
+    dist = math.hypot(origin.trans.y, origin.trans.x) #+ np.linalg.norm(robot.GetManipulators()[0].GetEndEffectorTransform()[:2,3]-robot.GetTransform()[:2,3])
+    
+    dist -= 0.2355 # The distance between the openrave base origin and the point around which the base rotates.
+    base_cmd.linear.x = dx + dth * dist * math.cos(angle) # dx * cth + dy * sth + dth * dist * math.cos(angle)
+    base_cmd.linear.y = dy + dth * dist * math.sin(angle) #-dx * sth + dy * cth + dth * dist * math.sin(angle)
+    arm_cmd.vel.linear.z = dz
+    base_cmd.angular.z = dth  # No roll or pitch yet
+    #print "%s before formation correction cmd: %f %f %f %f" % (my_name, base_cmd.linear.x, base_cmd.linear.y, arm_cmd.vel.linear.z, base_cmd.angular.z)
+
+    (dd, dth) = compute_formation_correction(msg, actual_pose)
+    #print "%s: Formation correction: %f %f %f %f" % (my_name, dd.x, dd.y, dd.z, dth)
+
+    # Correction on orientation is done after transform
+    #dx  = actual_pose.trans.x - target_pose.trans.x
+    #dx = FORMATION_GAIN * (dx - math.copysign(DEAD_ZONE,dx)) if abs(dx) > DEAD_ZONE else 0.0
+    #dy  = actual_pose.trans.y - target_pose.trans.y
+    #dy = FORMATION_GAIN * (dy - math.copysign(DEAD_ZONE,dy)) if abs(dy) > DEAD_ZONE else 0.0
+    #dz  = actual_pose.trans.z - target_pose.trans.z
+    #if my_name == 'drc3':
+    #print "%s: dx: %f = %f - %f" % (my_name, dd.x, actual_pose.trans.x, target_pose.trans.x)
+    #print "%s: dy: %f = %f - %f" % (my_name, dd.y, actual_pose.trans.y, target_pose.trans.y)
+    #print "%s: dz: %f = %f - %f" % (my_name, dd.z, actual_pose.trans.z, target_pose.trans.z)
+    #dz = FORMATION_GAIN_Z * (dz - math.copysign(DEAD_ZONE,dz)) if abs(dz) > DEAD_ZONE else 0.0
+    #dth = normalize(actual_pose.get_yaw() - target_pose.get_yaw())
+    #dth = FORMATION_GAIN_W * (dth - math.copysign(DEAD_ZONE,dth)) if abs(dth) > DEAD_ZONE else 0.0
+
+    dd.x *= FORMATION_GAIN
+    dd.y *= FORMATION_GAIN
+    dd.z *= FORMATION_GAIN_Z
+    dth *= FORMATION_GAIN_W
+
+    #print "%s: dx:  %f" % (my_name, dd.x)
+    #print "%s: dy:  %f" % (my_name, dd.y)
+    #print "%s: dz:  %f" % (my_name, dd.z)
+    #print "%s: dth: %f" % (my_name, dth)
+
+    #dx = dy = dz = dth = 0 ## TODO: delete
+    base_cmd.linear.x += dd.x
+    base_cmd.linear.y += dd.y
+    #arm_cmd.vel.linear.z += dd.z
+    base_cmd.angular.z += dth
+    #print "%s after formation correction cmd: %f %f %f %f" % (my_name, base_cmd.linear.x, base_cmd.linear.y, arm_cmd.vel.linear.z, base_cmd.angular.z)
+
+    (dd, dth) = compute_stability_correction(msg, actual_pose)
+
+    dd.x *= STABILITY_GAIN
+    dd.y *= STABILITY_GAIN
+    dd.z *= STABILITY_GAIN_Z
+    dth *= STABILITY_GAIN_W
+
+    base_cmd.linear.x += dd.x
+    base_cmd.linear.y += dd.y
+    #arm_cmd.vel.linear.z += dd.z
+    base_cmd.angular.z += dth
+
+    # Mehmet added this block to keep the hands looking straight forward during transport.
+    #grasp_correction = compute_grasp_correction()
+    #print my_name,' grasp correction: ',grasp_correction
+    #arm_cmd.vel.angular.y += 3.0*FORMATION_GAIN_W*grasp_correction
+
+    ## NOTE: BEGIN DEBUG
+    """
+    ps_3a_4a = geometry_pose_to_pose(transform_by_subjects(empty_geometry_pose('/drc3_arm'), '/drc1_arm'))
+    ps_3_4 = geometry_pose_to_pose(transform_by_subjects(empty_geometry_pose('/drc3'), '/drc1'))
+    ps_3a_4 = geometry_pose_to_pose(transform_by_subjects(empty_geometry_pose('/drc3_arm'), '/drc1'))
+    ps_4a_4 = geometry_pose_to_pose(transform_by_subjects(empty_geometry_pose('/drc1_arm'), '/drc1'))
+
+    fleet_debug.data.extend(ps_3a_4a.trans[0:3])
+    fleet_debug.data.extend(ps_3_4.trans[0:3])
+    fleet_debug.data.extend(ps_3a_4.trans[0:3])
+    fleet_debug.data.extend(ps_4a_4.trans[0:3])
+    ## NOTE: _END_ DEBUG
+
+    debug_pub.publish(fleet_debug)
+    """
+    print "base cmd is ", base_cmd
+    return (base_cmd, arm_cmd)
+
+
+def handle_cmd_vel(msg):
+    global th
+    th.lock.acquire()
+    th.inmsg = copy.deepcopy(msg)
+    th.cond.notify()
+    th.lock.release()
+
+def handle_tuck_arms(msg):
+    global th
+    th.lock.acquire()
+    th.tuck_arms_until = time.time() + msg.data
+    #print 'in handle_tuck_arms. until: ',th.tuck_arms_until
+    th.cond.notify()
+    th.lock.release()
+
+def handle_fleet_cmd(msg):
+    if msg.command == 'tuck_arms':
+        handle_tuck_arms(msg)
+    elif msg.command == 'pause':
+        global th
+        th.lock.acquire()
+        th.paused = True
+        th.cond.notify()
+        th.lock.release()
+    elif msg.command == 'resume':
+        global th
+        th.lock.acquire()
+        th.paused = False
+        th.cond.notify()
+        th.lock.release()
+    else:
+        print 'Unknown fleet command: ',msg.command
+
+def handle_transform(msg):
+    """Adjust the origin of the motion frame.  If the frame_id is empty,
+       perform a relative frame update.  Otherwise, perform an absolute
+       adjustment of the frame with respect to frame_id."""
+    ## TODO: handle relative case, handle other frames besides /map
+    #ps = transform_by_subjects(msg, my_frame)
+    pose = global_frame_to_body_frame(msg)
+    #pose = Pose3().new_pose(Point3(ps.pose.position.x, ps.pose.position.y,
+    #                               ps.pose.position.z),
+    #                        Quaternion(ps.pose.orientation.w,
+    #                                   ps.pose.orientation.x,
+    #                                   ps.pose.orientation.y,
+    #                                   ps.pose.orientation.z))
+    set_transform_origin(pose)
+    
+
+
+def handle_set_fleet(msg):
+    global base_cmd_pub, arm_cmd_pub
+    base_cmd_pub.publish(Twist())
+    #arm_cmd_pub.publish(TrackCartesian())
+
+    global watch_list, arms_list, want_pose #want_inv, 
+    watch_list = [ name for name in msg.group ]
+    print 'watch_list is ', watch_list
+    arms_list = [ name + '_arm' for name in msg.group ]
+    #print "handle_set_fleet called with names: %s" % msg.group
+    while True:
+        mean_pose = get_mean_pose(watch_list)
+        if mean_pose is None:
+            #print "mean_pose sleep"
+            rospy.sleep(0.1)
+            continue
+        want_pose = mean_pose
+        #want_inv = Pose3().new_from_matrix(mean_pose.get_matrix().inverse())
+
+        # Need globally consistent orientation of the origin.
+        ps = PoseStamped()
+        ps.header.frame_id = '/map'
+        ps.pose.orientation.w = 1.0
+        #ps = transform_by_subjects(ps, my_frame)
+        #origin_pose = geometry_pose_to_pose(ps.pose)
+        
+        #Andy change
+        #origin_pose = global_frame_to_arm_frame(ps)
+        origin_pose = geometry_pose_to_pose(ps.pose)
+        
+        origin_pose.trans = mean_pose.trans
+        set_transform_origin(origin_pose)
+        break
+
+
+class ThreadClass(threading.Thread):
+    def __init__(self):
+        super(ThreadClass, self).__init__()
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.inmsg = None
+        self.tuck_arms_until = 0.
+        self.paused = False
+
+    def run(self):
+        #print "FC: begin thread"
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+
+        tucking_arms = False
+        sent_zeros = False
+
+        while not rospy.is_shutdown():
+            self.lock.acquire()
+            #print "FC: LOCK acquired by thread"
+            self.cond.wait(CMD_TIMEOUT)
+
+            # Here if either timed out or got a command
+
+            if self.inmsg is None:
+                # We will make a note so that we can skip the command phase later
+                msg = None
+            else:
+                msg = copy.deepcopy(self.inmsg)
+            
+            tuck_arms_until = self.tuck_arms_until
+            paused = self.paused
+
+            self.lock.release()
+
+            # Transmit fleet origin pose
+            if origin is not None:
+                #ps = PoseStamped()
+                #ps.pose = pose_to_geometry_pose(origin)
+                #ps.header.frame_id = '/map'
+                #ps = transform_by_subjects(ps, "/map")
+                pose = pose_to_geometry_pose(arm_frame_to_global_frame(origin))
+                #print "%s: origin: %s" % (my_name, pose)
+                pose_pub.publish(pose)
+
+            if msg is None:
+                print 'msg is none'
+                continue
+
+            # Now send base and arm commands
+            base_cmd,arm_cmd = transform_cmd_to_base_and_arm(msg)
+            print 'base cmd is', base_cmd
+            #print 'time: ', time.time()
+            #print 'tuckuntil: ',tuck_arms_until
+            if time.time() < tuck_arms_until:
+                tucking_arms = True
+                #print 'Trying to tuck.'
+                arm_cmd.vel.linear.x = 0.012
+                base_cmd.linear.x = 0.012
+            else:
+                if tucking_arms:
+                    arm_cmd.vel.linear.x = 0.0
+                    base_cmd.linear.x = 0.0
+                    tucking_arms = False
+
+            if base_cmd is not None:
+                #print base_cmd
+                if base_cmd.linear.x > MAX_COMPONENT:
+                    print "Robot ",my_name,": Max velocity in x exceeded ", base_cmd.linear.x
+                    base_cmd.linear.x = MAX_COMPONENT
+                if base_cmd.linear.y > MAX_COMPONENT:
+                    print "Robot ",my_name, ": Max velocity in y exceeded ", base_cmd.linear.y
+                    base_cmd.linear.y = MAX_COMPONENT
+
+                if paused and not sent_zeros:
+                    base_cmd_pub.publish(Twist())
+                    #arm_cmd_pub.publish(TrackCartesian())
+                    sent_zeros = True
+
+                if not paused:
+                    base_cmd_pub.publish(base_cmd)
+                    #arm_cmd_pub.publish(arm_cmd)
+                    sent_zeros = False
+
+        # STOP commands
+        base_cmd_pub.publish(Twist())
+        #arm_cmd_pub.publish(TrackCartesian())
+
+
+my_name = re.sub(r'/', r'', rospy.get_namespace())
+my_frame = '/' + my_name
+arm_name = my_name + '_arm'
+arm_frame = my_frame + '_arm'
+
+myname_bare = re.sub('/','',my_name) # strip off the slashes.
+youbotenv = YoubotEnv(sim=False,viewer=False,env_xml=None,youbot_names=[myname_bare])
+robot = youbotenv.youbots[myname_bare]
+
+th = ThreadClass()
+th.start()
+
+debug_pub = rospy.Publisher('/' + my_name + 'debug',FleetDebug)
+
+base_cmd_pub = rospy.Publisher('cmd_vel', Twist)
+arm_cmd_pub = rospy.Publisher('track_cartesian', TrackCartesian)
+pose_pub = rospy.Publisher('fleet_origin', Pose)
+
+cmd_sub = rospy.Subscriber('multi_cmd', Twist, handle_cmd_vel)
+#tuck_arms_sub = rospy.Subscriber('/tuck_arms', Float64, handle_tuck_arms)
+fleet_cmd_sub = rospy.Subscriber('/fleet_cmd', FleetCommand, handle_fleet_cmd)
+trans_sub = rospy.Subscriber('transform_origin', PoseStamped,
+                             handle_transform)
+
+force_topic_x = rospy.Publisher(my_name + 'forcex', Float64)
+force_topic_z = rospy.Publisher(my_name + 'forcez', Float64)
+
+sub = rospy.Subscriber('set_fleet', Fleet, handle_set_fleet)
+
+rospy.spin()

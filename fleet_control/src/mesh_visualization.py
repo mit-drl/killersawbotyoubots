@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+
+## This node directs two robots transporting a wing skin from a start to
+## a goal location.  The start location is on a rack, and the goal is
+## mounted on the wing ladder.
+
+import roslib; roslib.load_manifest('fleet_control')
+from geometry_msgs.msg import Twist,Pose,PoseStamped,PointStamped, Point, Quaternion, Vector3, Vector3Stamped
+from std_msgs.msg import String,Float64, Header, Time
+from visualization_msgs.msg import Marker
+from mit_msgs.msg import ObjectPose
+import time
+import rospy
+import math
+import numpy as np
+
+import vicon_utils
+
+
+fleet_origin = None
+kinect_obj_pos = None
+
+def get_fleet_origin(msg):
+    global fleet_origin
+    fleet_origin = msg
+
+def handle_subjects(msg):
+    global kinect_obj_pos
+    kinect_obj_pos = msg
+
+
+rospy.Subscriber('/fleet_origin', Pose, get_fleet_origin)
+
+rospy.Subscriber('/output', ObjectPose,
+                             handle_subjects)
+
+
+rospy.init_node('mesh_visualization')
+
+#First, set up the mesh for the computer:
+
+computer_coordinates = Point(x=2.0, y=-5.0, z=0.5)
+
+computer_marker = Marker()
+
+computer_marker.pose.position = computer_coordinates
+computer_marker.pose.orientation = Quaternion(x=0.7, y=0.0, z=0.0, w=0.7)
+computer_marker.type = Marker.MESH_RESOURCE
+computer_marker.action = Marker.ADD
+computer_marker.scale = Vector3(x=2.0, y=2.0, z=2.0)
+computer_marker.mesh_resource = 'package://mbhp/resources/imac.dae'
+computer_marker.color.a = 1.0
+computer_marker.color.r = 0.4
+computer_marker.color.g = 0.4
+computer_marker.color.b = 0.4
+computer_marker.header.frame_id = '/map'
+
+computer_pub = rospy.Publisher('/computer_marker', Marker)
+rospy.sleep(1.0)
+computer_pub.publish(computer_marker)
+rospy.sleep(0.5)
+
+#Second, set up a loop to continually publish the ladder, rack, and skin
+
+print 'finished computer pub'
+
+rack_pub = rospy.Publisher('/rack_marker', Marker)
+ladder_pub = rospy.Publisher('/ladder_marker', Marker)
+skin_pub = rospy.Publisher('/skin_marker', Marker)
+
+
+
+while not rospy.is_shutdown():
+    try:
+        rack = vicon_utils.get_subject('nu_rack')
+        #the -0.5 is the difference between corner and center aligned meshes
+        rack_coordinates = Point(x=rack.translational.x / 1000.0 - 0.45, y=rack.translational.y / 1000.0 - 0.3, z=rack.translational.z / 1000.0 - 0.45)
+        rack_marker = Marker()
+        rack_marker.pose.orientation = Quaternion(x=0.5, y=0.5, z=0.5, w=0.5)
+        rack_marker.pose.position = rack_coordinates
+        rack_marker.type = rack_marker.MESH_RESOURCE
+        rack_marker.action = rack_marker.ADD
+        rack_marker.scale = Vector3(x=0.001, y=0.001, z=0.001)
+        rack_marker.mesh_resource = 'package://mbhp/resources/rack.stl' #TODO: make this
+        rack_marker.color.a = 1.0
+        rack_marker.color.r = 0.4
+        rack_marker.color.g = 0.4
+        rack_marker.color.b = 0.4
+        rack_marker.header.frame_id = '/map'
+        rack_pub.publish(rack_marker)
+    except:
+        pass #don't worry if we miss a beat
+
+    try:
+        ladder = vicon_utils.get_subject('ladder')
+        ladder_coordinates = Point(x=ladder.translational.x / 1000.0, y=ladder.translational.y / 1000.0, z=ladder.translational.z / 1000.0)
+        ladder_marker = Marker()
+        ladder_marker.pose.orientation = Quaternion(x=0.7, y=0.0, z=0.0, w=-0.7)
+        ladder_marker.pose.position = ladder_coordinates
+        ladder_marker.type = ladder_marker.MESH_RESOURCE
+        ladder_marker.action = ladder_marker.ADD
+        ladder_marker.scale = Vector3(x=1.7, y=1.0, z=1.0)
+        ladder_marker.color.a = 1.0
+        ladder_marker.color.r = 0.4
+        ladder_marker.color.g = 0.4
+        ladder_marker.color.b = 0.4
+        ladder_marker.mesh_resource = 'package://mbhp/resources/ladder.stl'
+        ladder_marker.header.frame_id = '/map'
+        ladder_pub.publish(ladder_marker)
+    except:
+        pass #don't worry if we miss a beat
+    
+    try:
+        skin_marker = Marker()
+        if kinect_obj_pos is not None and kinect_obj_pos.name is 'skin':
+            skin = kinect_obj_pos
+            skin_coordinates = Point(x=skin.origin.x, y=skin.origin.y, z= skin.origin.z + 0.025)
+            skin_marker.pose.orientation = Quaternion(x=0.0, y=-0.7, z=0.7, w=0.0)
+        elif fleet_origin is not None:
+            skin_coordinates = Point(x=fleet_origin.position.x, y=fleet_origin.position.y, z=fleet_origin.position.z + 0.025)
+            skin_marker.pose.orientation = Quaternion(x=0.0, y=-0.7, z=0.7, w=0.0)
+        else:
+            skin_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=1.0, w=0.0)
+            
+            skin_coordinates = Point(x=rack.translational.x / 1000.0, y=rack.translational.y / 1000.0 - 0.15, z= rack.translational.z / 1000.0 + 0.1)
+        skin_marker.pose.position = skin_coordinates
+        skin_marker.type = skin_marker.MESH_RESOURCE
+        skin_marker.action = skin_marker.ADD
+        skin_marker.scale = Vector3(x=1.7, y=1.0, z=1.0)
+        skin_marker.color.a = 1.0
+        skin_marker.color.r = 0.4
+        skin_marker.color.g = 0.4
+        skin_marker.color.b = 0.4
+        skin_marker.mesh_resource = 'package://mbhp/resources/skin.stl'
+        skin_marker.header.frame_id = '/map'
+        skin_pub.publish(skin_marker)
+    except:
+        pass #don't worry if we miss a beat
+    
+    rospy.sleep(0.3)

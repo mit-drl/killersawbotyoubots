@@ -1,0 +1,5 @@
+hole_detection/Hole hole
+std_msgs/Float64 angle
+string hole_name
+---
+bool success

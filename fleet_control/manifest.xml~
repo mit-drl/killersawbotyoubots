@@ -1,0 +1,34 @@
+<package>
+  <description brief="fleet_control">
+
+     fleet_control
+
+  </description>
+  <author>Ross A Knepper</author>
+  <license>BSD</license>
+  <review status="unreviewed" notes=""/>
+  <url>http://ros.org/wiki/fleet_control</url>
+
+  <depend package="tf"/>
+  <depend package="rospy"/>
+  <depend package="euclid"/>
+  <depend package="nav_msgs"/>
+  <depend package="std_msgs"/>
+  <depend package="mit_msgs"/>
+  <!--depend package="track_obj"/-->
+  <depend package="geometry_msgs"/>
+  <depend package="brics_actuator"/>
+  <depend package="assembly_common"/>
+  <depend package="hole_detection"/>
+  <depend package="youbotpy"/>
+  <depend package="hole_detection"/>
+  <depend package="track_obj"/>
+  <depend package="visual_inspection"/>
+  <depend package="assembly_common"/>
+
+  <!--export>
+      <python path="./src"/>
+  </export-->
+</package>
+
+

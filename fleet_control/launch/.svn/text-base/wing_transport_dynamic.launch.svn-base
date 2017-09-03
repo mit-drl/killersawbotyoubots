@@ -1,0 +1,173 @@
+<?xml version="1.0"?>
+<launch>
+<!--
+        <machine name="drc2" address="drc2" user="youbot" timeout="30"
+                 env-loader="/home/youbot/rosenv.sh" />
+ -->
+        <machine name="drc3" address="drc3" user="youbot" timeout="30"
+                 env-loader="/home/youbot/rosenv.sh" />
+        <machine name="drc1" address="drc1" user="youbot" timeout="30"
+                 env-loader="/home/youbot/rosenv.sh" />
+<!--
+        <machine name="drc4" address="drc4" user="youbot" timeout="30"
+                 env-loader="/home/youbot/rosenv.sh" />
+ -->
+
+	<rosparam file="$(find assembly_common)/config/parameters.yaml" command="load" />
+
+	<!-- <include file="$(find fleet_control)/launch/gripper_only_joy.launch" /> -->
+
+
+  <node name="wing_transport_master" pkg="fleet_control"
+        type="two_robot_pickup.py" output="screen" />
+
+	<node name="fleet_master" pkg="fleet_control"
+              type="fleet_master.py" output="screen" />
+<!--
+  <node name="mesh_visualization" pkg="fleet_control"
+              type="mesh_visualization.py" output="screen" />
+ -->
+	<!--<group ns="drc2">
+		<node machine="drc3" name="arm" pkg="robot"  type="arm.py" output="log" />
+	</group>-->
+
+  <group ns="drc3">
+    <node name="wing_transport" pkg="fleet_control"
+                      type="wing_transport.py" output="screen" />
+
+    <node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller_nogain.py" output="screen" />
+
+                <node machine="drc3" name="arm_feedback" pkg="robot"  type="arm_feedback.py" output="screen">
+                    <remap from="/tf" to="/drc3/tf"/>
+                </node>
+
+                <!--node name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="screen" /-->
+                <node machine="drc3" name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="log" />
+
+                <node machine="drc3" name="arm" pkg="robot"  type="arm.py" output="log" />
+
+                <node machine="drc3" name="vicon" pkg="vicon"  type="vicon.py" output="screen" />
+
+               <!-- <node machine="drc3" name="youbot_ik" pkg="fleet_control" type="youbot_ik.py" args="/home/youbot/ros_stacks/drl-youbot/fleet_control/openrave/models" />-->
+  </group>
+
+    <!--group ns="drc2">
+		<node name="wing_transport" pkg="fleet_control"
+                      type="wing_transport.py" output="screen" />
+
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller.py" output="screen" />
+
+                <node machine="drc2" name="arm_feedback" pkg="robot"  type="arm_feedback.py" output="screen">
+                    <remap from="/tf" to="/drc2/tf"/>
+                </node>
+
+                <node machine="drc2" name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="log" />
+
+                <node machine="drc2" name="arm" pkg="robot"  type="arm.py" output="log" />
+
+                <node machine="drc2" name="vicon" pkg="vicon"  type="vicon.py" output="screen" />
+
+                <node name="text_to_speech" pkg="text_to_speech"
+                      type="text_to_speech.py" machine="drc4"/>
+                <node name="text_to_speech_male" pkg="text_to_speech"
+                      type="text_to_speech_male.py" machine="drc4"/>
+
+	</group-->
+
+
+	<group ns="drc1">
+		<node name="wing_transport" pkg="fleet_control"
+                      type="wing_transport.py" output="screen" />
+
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller_nogain.py" output="screen" />
+
+                <node machine="drc1" name="arm_feedback" pkg="robot"  type="arm_feedback.py" output="screen">
+                    <remap from="/tf" to="/drc1/tf"/>
+                </node>
+
+                <!--node name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="screen" /-->
+                <node machine="drc1" name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="log" />
+
+                <node machine="drc1" name="arm" pkg="robot"  type="arm.py" output="log" />
+
+                <node machine="drc1" name="vicon" pkg="vicon"  type="vicon.py" output="screen" />
+
+               <!-- <node machine="drc1" name="youbot_ik" pkg="fleet_control" type="youbot_ik.py" args="/home/youbot/ros_stacks/drl-youbot/fleet_control/openrave/models" />-->
+	</group>
+
+<!--
+	<group ns="drc2">
+		<node name="wing_transport" pkg="fleet_control"
+                      type="wing_transport.py" output="screen" />
+
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller.py" output="screen" />
+
+                <node machine="drc2" name="arm_feedback" pkg="robot"  type="arm_feedback.py" output="screen">
+                    <remap from="/tf" to="/drc2/tf"/>
+                </node>
+
+                <node machine="drc2" name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="log" />
+
+                <node machine="drc2" name="arm" pkg="robot"  type="arm.py" output="log" />
+
+                <node machine="drc2" name="vicon" pkg="vicon"  type="vicon.py" output="screen" />
+
+                <node name="text_to_speech" pkg="text_to_speech"
+                      type="text_to_speech.py" machine="drc2" />
+                <node name="text_to_speech_male" pkg="text_to_speech"
+                      type="text_to_speech_male.py" machine="drc2"/>
+
+
+	</group>
+ -->
+
+	<!--group ns="drc4">
+		<node name="wing_transport" pkg="fleet_control"
+                      type="wing_transport.py" output="screen" />
+
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller.py" output="screen" />
+
+                <node machine="drc4" name="arm_feedback" pkg="robot"  type="arm_feedback.py" output="screen">
+                    <remap from="/tf" to="/drc4/tf"/>
+                </node>
+
+                <node machine="drc4" name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="log" />
+
+                <node machine="drc4" name="arm" pkg="robot"  type="arm.py" output="log" />
+
+                <node machine="drc4" name="vicon" pkg="vicon"  type="vicon.py" output="screen" />
+
+                <node name="text_to_speech" pkg="text_to_speech"
+                      type="text_to_speech.py" machine="drc4" />
+                <node name="text_to_speech_male" pkg="text_to_speech"
+                      type="text_to_speech_male.py" machine="drc4"/>
+
+
+	</group-->
+<!--
+<node name = "marker_node" pkg = "new_assembly_plugin" type = "marker_node.py" output = "screen" />
+ -->
+
+<group ns="master">
+  <node name="text_to_speech" pkg="text_to_speech"
+    type="text_to_speech.py"/>
+  <node name="text_to_speech_male" pkg="fleet_control"
+    type="text_to_speech_male.py"/>
+</group>
+
+
+<node name="relay_text_2" pkg="topic_tools" type="relay"
+    args="/drc2/text_to_speech /master/text_to_speech"/>
+<node name="relay_text_male_2" pkg="topic_tools" type="relay"
+    args="/drc2/text_to_speech_male /master/text_to_speech_male"/>
+<node name="relay_text_1" pkg="topic_tools" type="relay"
+    args="/drc1/text_to_speech /master/text_to_speech"/>
+<node name="relay_text_male_1" pkg="topic_tools" type="relay"
+    args="/drc1/text_to_speech_male /master/text_to_speech_male"/>
+
+</launch>

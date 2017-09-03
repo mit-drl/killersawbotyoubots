@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /home/drl-mocap/ros_stacks/drl-youbot/fleet_control/build/devel/setup.sh

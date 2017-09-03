@@ -1,0 +1,291 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import roslib; roslib.load_manifest('fleet_control')
+import rospy
+import numpy as np
+import openravepy as orpy
+import re
+import time
+import euclid
+import copy
+from brics_actuator.msg import JointPositions, JointValue
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Twist, PoseStamped, Pose
+from fleet_control.msg import VelTwist, Fleet
+
+
+import threading
+import sys
+import tf
+import tf.transformations as tr
+from mit_msgs.msg import MocapPosition
+from std_msgs.msg import Bool
+
+from vicon_utils import *
+
+temp = None
+
+ang_thresh = 0.2
+ang_speed = 0.001
+simulation = True
+robot = ['drc1', 'drc3'] #TODO: un-hardcode this
+control = 'drc4'
+
+fleet_origin = None
+
+def get_fleet_origin_in_frame(frame):
+    global_fleet_pose = PoseStamped()
+    global_fleet_pose.header.frame_id = '/map'
+    global_fleet_pose.pose = fleet_origin
+    return transform_by_subjects(global_fleet_pose, frame)
+
+
+def from_frame_to_fleet_origin_frame(frame, twist):
+    twist = copy.copy(twist)
+    local_fleet_pose = get_fleet_origin_in_frame(frame)
+    qt = euclid.Quaternion(local_fleet_pose.pose.orientation.w,
+                           local_fleet_pose.pose.orientation.x,
+                           local_fleet_pose.pose.orientation.y,
+                           local_fleet_pose.pose.orientation.z)
+    fleet_pitch, fleet_yaw, fleet_roll = qt.get_euler()
+    # First represent the twist relative to fleet_frame, but represented in frame
+    angular_vel_vector = np.array([0.0,0.0,twist.angular.z])
+    frame_to_fleet_origin_vector = np.array([local_fleet_pose.pose.position.x,local_fleet_pose.pose.position.y,0.0])
+    linear_vel_at_fleet_due_to_angular_vel_at_frame = np.cross(angular_vel_vector,frame_to_fleet_origin_vector)
+    twist.linear.x = twist.linear.x + linear_vel_at_fleet_due_to_angular_vel_at_frame[0]
+    twist.linear.y = twist.linear.y + linear_vel_at_fleet_due_to_angular_vel_at_frame[1]
+
+    # Now represent everything in fleet_frame
+    out = Twist()
+    sy = np.sin(fleet_yaw)
+    cy = np.cos(fleet_yaw)
+    out.linear.x =  cy * twist.linear.x + sy * twist.linear.y
+    out.linear.y = -sy * twist.linear.x + cy * twist.linear.y
+    out.linear.z = twist.linear.z
+    out.angular.z = twist.angular.z
+    # Assume roll and pitch are zero
+    return out
+
+
+class TestSearch:
+
+    #def establish_fleet_formation(self):
+    #    set_fleet_topic = '/set_fleet'
+    #    set_fleet = rospy.Publisher(set_fleet_topic, Fleet, latch=True)
+    #    fleet = Fleet()
+    #    fleet.group.extend(robot)
+    #    set_fleet.publish(fleet)
+    #    origin = PoseStamped()
+    #    origin.header.frame_id = '/map'
+    #    origin.pose = vicon_to_geometry_pose('drc4_arm')
+    #    transform_origin_pub.publish(origin)
+
+    def switch_handler(boolean):
+        global pub_base
+        global control
+        if boolean.data is True:
+            control = 'fleet'
+            pub_base = rospy.Publisher('/multi_cmd', Twist, latch=True)
+            return True
+        else:
+            control = 'drc4'
+            pub_base = rospy.Publisher('/cmd_vel', Twist, latch=True)
+            return False
+
+    def set_robot_location(self):
+        if simulation:
+            position = self.robot.GetTransform()
+            trans = np.array([position[0, 3], position[1, 3], position[2, 3]])
+            euler = tr.euler_from_matrix(position)
+            twist = Twist()
+            twist.linear.x = trans[0]
+            twist.linear.y = trans[1]
+            twist.linear.z = trans[2]
+            twist.angular.x = euler[0]
+            twist.angular.y = euler[1]
+            twist.angular.z = euler[2]
+            
+            pub_pos.publish(twist)
+            #raw_input('published')
+            
+        else:
+            global listener
+            #print my_name
+            (trans,quat) = listener.lookupTransform('/map', my_name, rospy.Time(0))
+            euler = tr.euler_from_quaternion(quat)
+
+            cur_pos = tr.compose_matrix(angles=euler, translate=np.array(trans))
+            with self.robot.GetEnv():
+                self.robot.SetTransform(cur_pos)
+            #TODO: is this topic really necessary?
+            twist = Twist()
+            twist.linear.x = trans[0]
+            twist.linear.y = trans[1]
+            twist.linear.z = trans[2]
+            twist.angular.x = euler[0]
+            twist.angular.y = euler[1]
+            twist.angular.z = euler[2]
+            pub_pos.publish(twist)
+        #print "position is"
+        #print twist
+        
+        
+    def __init__(self, pub_base):
+        self.pub_base = pub_base
+        self.env = orpy.Environment() # create openrave environment
+        if simulation:
+            physics = orpy.RaveCreatePhysicsEngine(self.env, "ode")
+            self.env.SetPhysicsEngine(physics)
+        #self.env.SetViewer('qtcoin') # attach viewer (optional)
+        self.env.Load(path + '/robots/kuka-youbot.robot.xml') 
+        self.robot = self.env.GetRobots()[0]
+        self.manip = self.robot.GetManipulators()[0]
+        with self.robot.GetEnv():
+            self.robot.SetActiveManipulator(self.manip)
+        self.cur_pos = np.zeros(5)
+        self.lock = threading.Lock()
+        self.set_robot_location()
+        print 'finished constructor'
+    
+    def update_vel(self, msg):
+        with self.robot.GetEnv():
+            self.robot.SetVelocity(np.array([msg.linear.x, msg.linear.y, msg.linear.z]), np.array([msg.angular.x, msg.angular.y, msg.angular.z]))
+
+    def handle_base_command_fine(self, msg):
+        #msg is a twist representing xyz euler angles
+        try:
+            self.lock.acquire()
+            self.new_base_vel = msg.velocity.data
+            self.new_dist_thresh = self.new_base_vel / 10.0
+            self.new_x_goal = msg.target.linear.x
+            self.new_y_goal = msg.target.linear.y
+            self.new_yaw_goal = msg.target.angular.z
+            self.new_target = True
+        finally:
+            self.lock.release()
+
+    def run(self):            
+        global pub_base
+        at_goal = True
+        self.new_target = False
+        while not rospy.is_shutdown():
+            try:
+                self.lock.acquire()
+                if self.new_target:
+                    #print 'GOT NEW TARGET'
+                    self.new_target = False
+                    base_vel = self.new_base_vel
+                    dist_thresh = self.new_dist_thresh
+                    x_goal = self.new_x_goal
+                    y_goal = self.new_y_goal
+                    yaw_goal = self.new_yaw_goal
+                    at_goal = False
+            finally:
+                self.lock.release()
+
+            if at_goal:
+                #print 'Already at goal'
+                time.sleep(0.1)
+                continue
+
+            self.set_robot_location()
+            if simulation:
+                cur = self.robot.GetTransform()
+                trans = np.array([cur[0, 3], cur[1, 3], cur[2, 3]])
+                quat = tr.quaternion_from_matrix(cur)
+            else:
+                (trans,quat) = listener.lookupTransform('/map', my_name, rospy.Time(0))
+            x_diff = x_goal - trans[0]
+            y_diff = y_goal - trans[1]
+            dist2 = np.sqrt(x_diff * x_diff + y_diff * y_diff)
+            twist = Twist()
+            twist.linear.x = x_diff/dist2 * base_vel
+            twist.linear.y = y_diff/dist2 * base_vel
+            twist.linear.z = 0
+            euler_current = tr.euler_from_quaternion(quat)
+            ang_diff_z = yaw_goal - euler_current[2]
+            ang2 = np.sqrt(ang_diff_z * ang_diff_z)
+            if ang2 < 0.00001:
+                twist.angular.x = 0
+                twist.angular.y = 0
+                twist.angular.z = 0
+            else:
+                twist.angular.z = ang_diff_z/ ang2 * ang_speed
+            #print 'the velocity commanded is:'
+            #print twist
+            if dist2 < dist_thresh and ang2 < ang_thresh:
+                self.pub_base.publish(Twist())
+                if simulation:
+                    self.update_vel(Twist())
+                at_goal = True
+                print 'stopped.'
+            else:
+                if control == 'drc4':
+                    self.pub_base.publish(twist)
+                elif control == 'fleet':
+                    # convert twist to fleet_frame
+                    twist_in_fleet = from_frame_to_fleet_origin_frame('drc4',twist)
+                    self.pub_base.publish(twist_in_fleet)
+                if simulation:
+                    self.update_vel(twist)
+            time.sleep(0.1)
+            #print 'all done'
+            #rospy.sleep(0.2)
+                    
+                
+
+def handle_fleet_origin(msg):
+    global fleet_origin
+    fleet_origin = msg
+
+            
+        
+            
+path = ''
+
+
+if len(sys.argv) < 2:
+    print "Usage: youbot_ik.py <model_location>"
+else:
+    path = sys.argv[1]
+rospy.init_node('cmd_youbot_pos')
+listener = tf.TransformListener()
+rospy.sleep(2.0) #Build the buffer
+
+my_name = rospy.get_namespace()
+if my_name is '/':
+    my_name = '/drc4/'
+    
+print my_name
+
+in_command_topic_base_fine = my_name + 'ik_command_fine'
+out_command_topic_base = my_name + 'cmd_vel'
+#out_command_topic_base = '/multi_cmd'
+out_pos = my_name + 'location'
+print 'publisher name is ', out_pos
+
+pub_base = rospy.Publisher(out_command_topic_base, Twist, latch=True)
+
+print out_pos
+pub_pos = rospy.Publisher(out_pos, Twist, latch=True)
+
+ts = TestSearch(pub_base)
+th = threading.Thread(target=ts.run)
+th.start()
+
+rospy.Subscriber(in_command_topic_base_fine, VelTwist, ts.handle_base_command_fine,queue_size=1)
+#rospy.Subscriber(out_command_topic_base, Twist, ts.update_vel)
+switch = rospy.Service('/switch', Switch, ts.switch_handler) 
+transform_origin_topic = '/transform_origin'
+
+fleet_origin_sub = rospy.Subscriber('/fleet_origin', Pose, handle_fleet_origin)
+
+#TODO: this won't be needed in the future as it's handled in the wing_transport_master
+#transform_origin_pub = rospy.Publisher(transform_origin_topic, PoseStamped, latch=True)
+#ts.establish_fleet_formation() #TODO: uncomment?
+
+print 'done initializing!'
+
+rospy.spin()
+

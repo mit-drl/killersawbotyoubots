@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import roslib; roslib.load_manifest('fleet_control')
+import rospy
+import numpy as np
+import openravepy as orpy
+import re
+import time
+from brics_actuator.msg import JointPositions, JointValue
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Twist
+
+import threading
+import sys
+import tf
+import tf.transformations as tr
+from mit_msgs.msg import MocapPosition
+from std_msgs.msg import Float64, Bool
+from fleet_control.msg import VelTwist
+
+
+temp = None
+
+coarse_velocity = 0.01
+fine_velocity = 0.002
+dist_thresh = 0.005
+step_thresh = 0.0005
+success_width = 0.012
+step_size = 0.001 #1 mm #TODO: let's make this adaptive
+inc = 0.002
+search_window_size = 0.10
+radius = (search_window_size - 0.05) / (2.0 * np.pi)
+
+
+sem = threading.Semaphore()
+
+debug = True
+
+
+
+simulation = True
+position = None
+
+found_the_hole = False
+
+def hole_found(msg):
+    global found_the_hole
+    found_the_hole = msg.data
+    
+    
+
+def set_position(location):
+    global position
+    global twist
+    twist = location #used just for starting position
+    #sem.acquire()
+    position = tr.compose_matrix(angles=np.array([location.angular.x, location.angular.y, location.angular.z]), \
+                                translate=np.array([location.linear.x, location.linear.y, location.linear.z]))
+    #sem.release()
+
+
+def step(move, angular):
+    goal = VelTwist()
+    cur = position
+    x_goal = cur[0, 3] + move[0]
+    y_goal = cur[1, 3] + move[1]
+    goal.target.linear.x = x_goal
+    goal.target.linear.y = y_goal
+    goal.target.angular.z = angular
+    goal.velocity.data = fine_velocity
+    pub_search.publish(goal)
+
+    dist2 = sys.maxint
+    while dist2 > step_thresh:
+        #TODO: put back the semaphores
+        #sem.acquire()
+        cur = position
+        #sem.release()
+        
+        trans = np.array([cur[0, 3], cur[1, 3], cur[2, 3]])
+        x_diff = x_goal - trans[0]
+        y_diff = y_goal - trans[1]
+        dist2 = np.sqrt(x_diff * x_diff + y_diff * y_diff)
+
+    
+
+def search(start_loc, condition):
+    #Just keeps searching until it satisfies some condition
+    """
+    TODO: integrate stopping condition...something like:
+    if condition(data):
+        publish stop
+        break
+    """
+    #1. get to starting location - assume this is handled externally
+    #2. Spiral out, keep going, spiral out, keep going (Archimedean)
+        #2a. Set target radius to be starting location + const * theta...and use the right trig to get x and y.  See below
+    global inc
+    while not found_the_hole > 0: #TODO: use  the condition here
+        
+        
+        x_goal = start_loc.linear.x + inc * radius * np.sin(inc)
+        y_goal = start_loc.linear.y + inc * radius * np.cos(inc)
+        print x_goal
+        print y_goal
+        twist = VelTwist()
+        twist.target.linear.x = x_goal
+        twist.target.linear.y = y_goal
+        twist.target.angular.z = start_loc.angular.z
+        twist.velocity.data = coarse_velocity
+        #print twist
+        #print "published next goal point!"
+        pub_search.publish(twist)
+        inc += 0.01
+        
+        #TODO: need some sort of ack or check system here
+        #TODO: come up with real world check system - using simulation only now
+        dist2 = sys.maxint
+        
+        while dist2 > dist_thresh and not found_the_hole > 0 :
+            #TODO: put back the semaphores
+            #sem.acquire()
+            cur = position
+            #sem.release()
+            
+            trans = np.array([cur[0, 3], cur[1, 3], cur[2, 3]])
+            x_diff = x_goal - trans[0]
+            y_diff = y_goal - trans[1]
+            dist2 = np.sqrt(x_diff * x_diff + y_diff * y_diff)
+            
+        print 'made it!'
+
+            #Do nothing, just keep spinning here until that's accomplished
+                
+    print 'All done!'
+    cur = position
+    trans = np.array([cur[0, 3], cur[1, 3], cur[2, 3]])
+    stop_twist = VelTwist()
+    stop_twist.target.linear.x = trans[0]
+    stop_twist.target.linear.y = trans[1]
+    stop_twist.target.angular.z = start_loc.angular.z
+    stop_twist.velocity.data = coarse_velocity
+    pub_search.publish(stop_twist)
+
+    #now that we're there, let's get to the center
+
+    old_hole_size = found_the_hole
+    while found_the_hole < success_width:
+        print 'guess width is ', found_the_hole
+        print 'success is ', success_width
+        #1. try a step north
+        #TODO: is thsi north?
+
+        angle = stop_twist.target.angular.z
+        x = np.cos(angle)
+        y = np.sin(angle)
+        
+        print 'step north'
+        
+        move = (x * step_size, y * step_size)
+        step(move, start_loc.angular.z)
+        print 'done stepping north'
+        if found_the_hole <= old_hole_size: #if it's a bad step, undo it
+            print 'undo'
+            move = (-x * step_size, -y * step_size)
+            step(move, start_loc.angular.z)
+        old_hole_size = found_the_hole
+
+
+
+        #3. try a step south
+        print 'step south'
+        move = (-x * step_size, -y * step_size)
+        step(move, start_loc.angular.z)
+        print 'done stepping south'
+        if found_the_hole <= old_hole_size: #if it's a bad step, undo it
+            print 'undo'
+            move = (x * step_size, y * step_size)
+            step(move, start_loc.angular.z)
+        old_hole_size = found_the_hole
+
+    print found_the_hole
+
+    #TODO: make a "stop" function
+    #cur = position
+    #trans = np.array([cur[0, 3], cur[1, 3], cur[2, 3]])
+    #stop_twist = VelTwist()
+    #stop_twist.target.linear.x = trans[0]
+    #stop_twist.target.linear.y = trans[1]
+    #stop_twist.target.angular.z = start_loc.angular.z
+    #stop_twist.velocity.data = 0.0
+    #pub_search.publish(stop_twist)
+
+
+
+        
+        
+
+
+
+
+
+path = ''
+
+
+if len(sys.argv) < 2:
+    print "Usage: youbot_ik.py <model_location>"
+else:
+    path = sys.argv[1]
+rospy.init_node('search')
+my_name = rospy.get_namespace()
+if my_name is '/':
+    my_name = '/drc4/'
+out_command_topic_base_fine = my_name + 'ik_command_fine'
+
+pub_search = rospy.Publisher(out_command_topic_base_fine, VelTwist)
+
+in_pos = my_name + 'location'
+
+rospy.Subscriber(in_pos, Twist, set_position)
+rospy.Subscriber('/drc4/hole_found', Float64, hole_found)
+
+rospy.sleep(1.0)
+print in_pos
+print 'done initializing!'
+listener = tf.TransformListener()
+if simulation:
+    start_loc = Twist()
+else:
+    while True:
+        try:
+            start_loc = twist
+            break
+        except Exception:
+            pass
+print 'time to search!'
+rospy.sleep(5.0)
+if not debug:
+    search(start_loc, None)
+switch_pub = rospy.Publisher('/switch', Bool)
+msg = Bool()
+msg.data = True
+switch_pub.publish(msg)
+rospy.sleep(0.2)
+search(start_loc, None)
+print 'finished'
+rospy.spin()

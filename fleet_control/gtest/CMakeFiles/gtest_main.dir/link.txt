@@ -1,0 +1,1 @@
+/usr/bin/c++  -fPIC -O2 -g   -shared -Wl,-soname,libgtest_main.so -o ../lib/libgtest_main.so CMakeFiles/gtest_main.dir/src/gtest_main.cc.o -L/home/drl-mocap/ros_stacks/drl-youbot/fleet_control/gtest/src -lpthread ../lib/libgtest.so -lpthread -Wl,-rpath,/home/drl-mocap/ros_stacks/drl-youbot/fleet_control/gtest/src:/home/drl-mocap/ros_stacks/drl-youbot/fleet_control/lib 

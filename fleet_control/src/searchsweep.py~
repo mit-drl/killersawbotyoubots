@@ -1,0 +1,846 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import roslib; roslib.load_manifest('fleet_control')
+import rospy
+import numpy as np
+import openravepy as orpy
+import re
+import time
+import copy
+import tf.transformations as tr
+from brics_actuator.msg import JointPositions, JointValue
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Twist,Point,PoseStamped
+from assembly_common.srv import BasePose
+
+from youbotpy import YoubotEnv
+import openravepy as orpy
+from youbotpy import youbotik as yik
+
+import matplotlib.pyplot as plt
+import threading
+import sys
+from itertools import izip
+from mit_msgs.msg import MocapPosition
+from std_msgs.msg import Float64, Bool, String
+from hole_detection.msg import Hole
+from hole_detection.srv import HoleDetectionParametrization
+from fleet_control.msg import VelTwist
+from fleet_control.srv import SearchHole,SearchHoleResponse,InsertToHole,Switch,SwitchRequest
+
+from vicon_utils import transform_by_subjects
+
+import IPython
+
+coarse_velocity = 0.006
+fine_velocity = 0.002
+
+simulation = True
+
+position = np.array([0.0,0.0,0.0])
+got_position = False
+position_lock = threading.Lock()
+
+hole = Hole()
+hole.width = -1.0
+hole.position.x = -1.0
+hole.position.y = -1.0
+hole.found = False
+hole_lock = threading.Lock()
+
+def hole_found(msg): # This is a callback. Can execute in a separate thread.
+    global hole
+    global hole_lock
+    hole_lock.acquire()
+    hole.width = msg.width
+    hole.position = msg.position
+    hole.found = msg.found
+    hole_lock.release()
+
+
+def set_position(location): # This is a callback. Can execute in a separate thread.
+    global position
+    global got_position
+    global position_lock
+    position_lock.acquire()
+    got_position = True
+    position = np.array([location.linear.x, location.linear.y, location.angular.z])
+    position_lock.release()
+
+
+# move is the required motion as a tuple: (x,y,yaw)
+def step(move, vel):
+    goal = VelTwist()
+    global position_lock
+    position_lock.acquire()
+    cur = copy.copy(position)
+    position_lock.release()
+    goal.target.linear.x = cur[0] + move[0]
+    goal.target.linear.y = cur[1] + move[1]
+    goal.target.angular.z = cur[2] + move[2]
+    goal.velocity.data = vel
+    pub_search.publish(goal)
+
+def MoveRobotTo_robot_relative(pose,vel):
+    global position_lock
+    position_lock.acquire()
+    cur = copy.copy(position)
+    position_lock.release()
+    pose_in_world = TransformPose(pose,cur)
+    MoveRobotTo(pose_in_world,vel)
+
+def MoveRobotTo(pose,vel):
+    goal = VelTwist()
+    goal.target.linear.x = pose[0]
+    goal.target.linear.y = pose[1]
+    goal.target.angular.z = pose[2]
+    goal.velocity.data = vel
+    pub_search.publish(goal)
+
+def J1Search(minlimit,maxlimit,resolution):
+    global youbotenv
+    global myname_bare
+    angles = youbotenv.GetRobot(myname_bare).GetDOFValues()[:5]
+    nsteps = np.ceil((maxlimit/minlimit)/resolution)
+    maxhole_angles = None
+    maxhole = Hole()
+    maxhole.width = -1.0
+    maxhole.found = False
+    for step in np.linspace(minlimit,maxlimit,nsteps):
+        newangles = angles.copy()
+        newangles[0] = newangles[0] + step
+        youbotenv.MoveArm(myname_bare,newangles)
+        hole = WaitForHole(0.,0.1)
+        if hole is not None and hole.width > maxhole.width:
+            print 'J1Search found hole of witdh: ',hole.width
+            maxhole_angles = newangles
+            maxhole = hole
+    youbotenv.MoveArm(myname_bare,angles) # Move to original config.
+    return maxhole_angles,maxhole
+
+def SearchHoleWithArm(pathname):
+    global youbotenv
+    global myname_bare
+    if pathname == 'ladder_hole' or pathname == 'ladder_hole_fine':
+        plane_height = -0.235
+    else:
+        plane_height = -0.215
+    hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                   crop_window_x_max_param=0.015,
+                                   crop_window_y_min_param=-0.50,
+                                   crop_window_y_max_param=-0.10,
+                                   plane_height_param=plane_height,
+                                   plane_uncertainty_param=0.025,
+                                   hole_width_param=0.015,
+                                   max_plane_angle_param=1.57,
+                                   make_before_after_check_param=True,
+                                   enforce_n_plane_points_before_hole_param=3,
+                                   enforce_n_plane_points_after_hole_param=3,
+                                   min_n_points_param=5)
+    current_hole = None
+    angles,current_hole = J1Search(-0.1,0.1,0.005)
+    if angles is None:
+        return None
+    youbotenv.MoveArm(myname_bare,angles)
+    time.sleep(1.0)
+    angles,current_hole = J1Search(-0.01,0.01,0.001)
+    if angles is None:
+        return None
+    youbotenv.MoveArm(myname_bare,angles)
+    time.sleep(1.0)
+    return current_hole
+
+def WaitForHole(goal_width,timeout):
+    global hole_lock
+    start_time = time.time()
+    while not rospy.is_shutdown():
+        hole_lock.acquire()
+        current_hole = copy.copy(hole)
+        hole_lock.release()
+        if current_hole.width >= goal_width:
+            return current_hole
+        if (time.time()-start_time) >= timeout:
+            return None
+
+def GetPath(pathname):
+    if pathname == 'ladder_hole' or pathname == 'ladder_hole_2' or pathname == 'ladder_hole_3' or pathname == 'ladder_hole_4':
+        return LadderHoleSearchPath(right_limit=0.02,left_limit=0.02,up_limit=0.001,down_limit=0.001)
+    elif pathname == 'ladder_hole_fine' or pathname == 'ladder_hole_fine_2' or pathname == 'ladder_hole_fine_3' or pathname == 'ladder_hole_fine_4':
+        return LadderHoleSearchPath(right_limit=0.005,left_limit=0.005,up_limit=0.001,down_limit=0.001)
+    elif pathname == 'skin_hole':
+        return SkinHoleSearchPath2(right_limit=0.04,left_limit=0.04,up_limit=0.01,down_limit=0.01,nsteps=4)
+    elif pathname == 'align':
+        return SkinHoleSearchPath2(right_limit=0.01,left_limit=0.01,up_limit=0.005,down_limit=0.005, nsteps=4)
+    elif pathname == 'align2':
+        return SkinHoleSearchPath2(right_limit=0.01,left_limit=0.01,up_limit=0.005,down_limit=0.005, nsteps=4)
+    elif pathname == 'skin_hole2':
+        return SecondSkinHoleSearchPath()
+    else:
+        print 'Error: unknown path name %s.'%(pathname)
+        return None
+
+
+def Search(pathname):
+    print 'Searching %s.'%(pathname)
+    if pathname == 'ladder_hole':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.235,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_2':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.215,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_3':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.215,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_4':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.215,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_fine':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.245,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_fine_2':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.225,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'ladder_hole_fine_3':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.225,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+
+    elif pathname == 'ladder_hole_fine_4':
+        service_switch(SwitchRequest(skin=False)) # Move drc4
+        hole_detection_parametrization(crop_window_x_min_param=-0.015, 
+                                       crop_window_x_max_param=0.015,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.225,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=1.57,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=3,
+                                       enforce_n_plane_points_after_hole_param=3,
+                                       min_n_points_param=5)
+    elif pathname == 'skin_hole':
+        service_switch(SwitchRequest(skin=True)) # Move fleet
+        hole_detection_parametrization(crop_window_x_min_param=-0.07,
+                                       crop_window_x_max_param=0.07,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.20,
+                                       plane_uncertainty_param=0.03,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=0.75,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=5,
+                                       enforce_n_plane_points_after_hole_param=10,
+                                       min_n_points_param=20)
+    elif pathname == 'skin_hole2':
+        service_switch(SwitchRequest(skin=True)) # Move fleet
+        hole_detection_parametrization(crop_window_x_min_param=-0.07,
+                                       crop_window_x_max_param=0.07,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.215,
+                                       plane_uncertainty_param=0.025,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=0.75,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=5,
+                                       enforce_n_plane_points_after_hole_param=10,
+                                       min_n_points_param=20)
+    elif pathname == 'align':
+        service_switch(SwitchRequest(skin=True)) # Move fleet
+        hole_detection_parametrization(crop_window_x_min_param=-0.07, 
+                                       crop_window_x_max_param=0.07,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.215,
+                                       plane_uncertainty_param=0.03,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=0.75,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=5,
+                                       enforce_n_plane_points_after_hole_param=10,
+                                       min_n_points_param=20)
+    elif pathname == 'align2':
+        service_switch(SwitchRequest(skin=True)) # Move fleet
+        hole_detection_parametrization(crop_window_x_min_param=-0.07, 
+                                       crop_window_x_max_param=0.07,
+                                       crop_window_y_min_param=-0.50,
+                                       crop_window_y_max_param=-0.10,
+                                       plane_height_param=-0.25,
+                                       plane_uncertainty_param=0.03,
+                                       hole_width_param=0.015,
+                                       max_plane_angle_param=0.75,
+                                       make_before_after_check_param=True,
+                                       enforce_n_plane_points_before_hole_param=5,
+                                       enforce_n_plane_points_after_hole_param=10,
+                                       min_n_points_param=20)
+
+
+    else:
+        print 'Unknown pathname: %s'%(pathname)
+
+    
+    if pathname == 'ladder_hole_fine' or pathname == 'ladder_hole' or pathname == 'ladder_hole_fine_2' or pathname == 'ladder_hole_2' or pathname == 'ladder_hole_3' or pathname == 'ladder_hole_fine_3' or pathname == 'ladder_hole_4' or pathname == 'ladder_hole_fine_4':
+        trytimes = 1
+    else:
+        trytimes = 2
+    for i in range(trytimes):
+        print 'trying searching %d th time.'%(i)
+        global position_lock
+        position_lock.acquire()
+        start_pose = copy.copy(position)
+        position_lock.release()
+        robot_relative_path = GetPath(pathname)
+        path = TransformPath(robot_relative_path,start_pose)
+        prev_pt = start_pose
+        current_hole = None
+        for pt in path: 
+            vel = fine_velocity
+            MoveRobotTo(pt,vel)
+            dist = np.linalg.norm((pt-prev_pt)[:2]) # ignoring rotation for now.
+            timeout = (dist/vel)+1.0 # wait an extra second
+            if pathname == 'align':
+                current_hole = WaitForHole(goal_width=0.0045, timeout=timeout)
+            elif pathname == 'ladder_hole_fine' or pathname == 'ladder_hole':
+                current_hole = WaitForHole(goal_width=0.007, timeout=timeout)
+            elif pathname == 'align2':
+                current_hole = WaitForHole(goal_width=0.0045, timeout=timeout)
+            elif pathname == 'ladder_hole_2' or pathname == 'ladder_hole_fine_2':
+                current_hole = WaitForHole(goal_width=0.005, timeout=timeout) #TODO: fix this?
+            elif pathname == 'ladder_hole_3' or pathname == 'ladder_hole_fine_3':
+                current_hole = WaitForHole(goal_width=0.003, timeout=timeout) #TODO: fix this?
+            elif pathname == 'ladder_hole_4' or pathname == 'ladder_hole_fine_4':
+                current_hole = WaitForHole(goal_width=0.004, timeout=timeout) #TODO: fix this?
+            else:
+                current_hole = WaitForHole(goal_width=0.003, timeout=timeout)
+                print 'in the else'
+            if current_hole is not None: # found the hole
+                position_lock.acquire()
+                cur_position = copy.copy(position)
+                position_lock.release()
+                MoveRobotTo(cur_position,fine_velocity) # stop where the robot is now.
+                break
+            prev_pt = pt
+        if current_hole is None:
+            print 'Hole not found.' 
+            #return None
+        else:
+            # move hole under sensor
+            align_speed = fine_velocity/2.0
+            if pathname == 'ladder_hole' or pathname=='ladder_hole_fine' or pathname == 'ladder_hole_fine_2' or pathname == 'ladder_hole_2' or pathname == 'ladder_hole_3' or pathname == 'ladder_hole_fine_3' or pathname == 'ladder_hole_4' or pathname == 'ladder_hole_fine_4':
+                MoveRobotTo_robot_relative((current_hole.position.x,0.0,0.0), align_speed)
+            elif pathname == 'skin_hole' or pathname == 'skin_hole2' or pathname == 'align' or pathname == 'align2':
+                MoveRobotTo_robot_relative((-current_hole.position.x,0.0,0.0), align_speed)
+            time.sleep((abs(current_hole.position.x)/align_speed) + 1.0)
+
+            if pathname == 'align':
+                current_hole = WaitForHole(goal_width=0.0045, timeout=4.0)
+            elif pathname == 'ladder_hole_fine' or pathname == 'ladder_hole':
+                current_hole = WaitForHole(goal_width=0.007, timeout=4.0)
+            elif pathname == 'ladder_hole_2' or pathname == 'ladder_hole_fine_2':
+                current_hole = WaitForHole(goal_width=0.005, timeout=4.0) #TODO: fix this?
+            elif pathname == 'ladder_hole_3' or pathname == 'ladder_hole_fine_3':
+                current_hole = WaitForHole(goal_width=0.003, timeout=4.0) #TODO: fix this?
+            elif pathname == 'ladder_hole_4' or pathname == 'ladder_hole_fine_4':
+                current_hole = WaitForHole(goal_width=0.005, timeout=4.0) #TODO: fix this?
+            elif pathname == 'align2':
+                current_hole = WaitForHole(goal_width=0.0045, timeout=4.0)
+            else:
+                print 'in the else'
+                current_hole = WaitForHole(goal_width=0.003, timeout=4.0)
+
+            if current_hole is not None: # found the hole
+                print 'Hole found! Returning.'
+                return current_hole
+            else:
+                if pathname == 'ladder_hole_fine_2' or pathname == 'ladder_hole_2' or pathname == 'ladder_hole_3' or pathname == 'ladder_hole_fine_3' or pathname == 'ladder_hole_4' or pathname == 'ladder_hole_fine_4':
+                    return None
+                print 'Hole was found but got lost while bringing under sensor.'
+                #print 'Re-searching.'
+                #return None # Or maybe just assume the hole is under sensor?
+    return None
+
+
+def XYYawToMatrix(xyyaw):
+    mat = np.eye(3)
+    ca = np.cos(xyyaw[2])
+    sa = np.sin(xyyaw[2])
+    mat[0,2] = xyyaw[0]
+    mat[1,2] = xyyaw[1]
+    mat[0,0] = ca
+    mat[1,0] = sa
+    mat[0,1] = -sa
+    mat[1,1] = ca
+    return mat
+
+
+def MatrixToXYYaw(mat):
+    return np.array([mat[0,2],mat[1,2],np.arctan2(mat[1,0],mat[0,0])])
+
+
+def TransformPose(pose_in_robot, robot_in_world):
+    robot_in_w_mat = XYYawToMatrix(robot_in_world)
+    pose_in_r_mat = XYYawToMatrix(pose_in_robot)
+    pose_in_world_mat = np.dot(robot_in_w_mat,pose_in_r_mat)
+    return MatrixToXYYaw(pose_in_world_mat)
+
+    
+def TransformPath(path,start_pose): 
+    new_path = []
+    for pose in path:
+        new_path.append(TransformPose(pose,start_pose))
+    return new_path
+
+
+def LadderHoleSearchPath(right_limit=0.02,left_limit=0.02,up_limit=0.01,down_limit=0.01,nsteps=1):
+    path = []
+    for i in range(nsteps):
+        # go right (-y in robot frame)
+        pt = np.array([0.0,-1.0*right_limit,0.0])
+        path.append(pt)
+        # go left 
+        pt = np.array([0.0,1.0*left_limit,0.0])
+        path.append(pt)
+        # go up (+x in robot frame)
+        pt = np.array([1.0*up_limit*(i+1),1.0*left_limit,0.0])
+        path.append(pt)
+        # go right
+        pt = np.array([1.0*up_limit*(i+1),-1.0*right_limit,0.0])
+        path.append(pt)
+        # go down
+        pt = np.array([-1.0*down_limit*(i+1),-1.0*right_limit,0.0])
+        path.append(pt)
+        # go left
+        pt = np.array([-1.0*down_limit*(i+1),1.0*left_limit,0.0])
+        path.append(pt)
+        # go back to starting pose
+        pt = np.array([0.0,0.0,0.0])
+        path.append(pt)
+    return path
+
+def SkinHoleSearchPath2(right_limit=0.02,left_limit=0.02,up_limit=0.01,down_limit=0.01,nsteps=1):
+    path = []
+    for i in range(nsteps):
+        # go left 
+        pt = np.array([0.0,1.0*left_limit*(i+1),0.0])
+        path.append(pt)
+        # go right (-y in robot frame)
+        pt = np.array([0.0,-1.0*right_limit*(i+1),0.0])
+        path.append(pt)
+        # go up (+x in robot frame)
+        pt = np.array([1.0*up_limit*(i+1),-1.0*right_limit*(i+1),0.0])
+        path.append(pt)
+        # go left
+        pt = np.array([1.0*up_limit*(i+1),1.0*left_limit*(i+1),0.0])
+        path.append(pt)
+        # go down
+        pt = np.array([-1.0*down_limit*(i+1),1.0*left_limit*(i+1),0.0])
+        path.append(pt)
+        # go left
+        pt = np.array([-1.0*down_limit*(i+1),-1.0*right_limit*(i+1),0.0])
+        path.append(pt)
+        # go back to starting pose
+        pt = np.array([0.0,0.0,0.0])
+        path.append(pt)
+    return path
+
+
+
+def SkinHoleSearchPath(right_limit=0.04,left_limit=0.0,up_step=0.01,n_steps=4):
+    path = []
+    for i in range(n_steps):
+        # go right (-y in robot frame)
+        pt = np.array([i*up_step,-1.0*right_limit,0.0])
+        path.append(pt)
+        # go up and left
+        pt = np.array([(i+1)*up_step,left_limit,0.0])
+        path.append(pt)
+    return path
+
+
+def AlignmentSearchPath():
+    path = []
+    # go right (-y in robot frame)
+    pt = np.array([0.0,-0.01,0.0])
+    path.append(pt)
+    # go left
+    pt = np.array([0.0,0.01,0.0])
+    path.append(pt)
+    # go center
+    pt = np.array([0.0,0.0,0.0])
+    path.append(pt)
+    # go down
+    pt = np.array([-0.01,0.0,0.0])
+    path.append(pt)
+    # go go up
+    pt = np.array([0.01,0.0,0.0])
+    path.append(pt)
+    # go center
+    pt = np.array([0.0,0.0,0.0])
+    path.append(pt)
+    return path
+
+
+def SecondSkinHoleSearchPath():
+    pass # TODO Later. But will probably be an arc.
+
+
+def DrawPath(path):
+    #hl, = plt.plot([], [])
+    xs = []
+    ys = []
+    for pt in path:
+        xs.append(pt[0])
+        ys.append(pt[1])
+        hl = plt.plot(xs,ys)
+        plt.show(block=False)
+        time.sleep(1.0)
+        plt.close()
+    #     hl.set_xdata(np.append(hl.get_xdata(), pt[0]))
+    #     hl.set_ydata(np.append(hl.get_ydata(), pt[1]))
+    #     plt.draw()
+    #     plt.show()
+    #     time.sleep(0.5)
+    hl = plt.plot(xs,ys)
+    plt.show()
+
+
+## Hole insertion functions start here.
+
+def LiftTool():
+    global robot
+    global youbotenv
+    global myname_bare
+    global hole_search_config
+    traj = orpy.RaveCreateTrajectory(youbotenv.env,"")
+    with open(hole_insertion_traj,'r') as fh:
+        trajstr = fh.read()
+    traj.deserialize(trajstr)
+    desc = traj.GetDescription()
+    eestep = float(desc.split(' ')[1])
+    aboveplate = int(np.ceil(0.03/eestep))
+    inhole = aboveplate + int(np.ceil(0.06/eestep))
+    for ind in range(inhole):
+        youbotenv.MoveArm(robot.GetName(),traj.GetWaypoint(inhole-ind)[:5]) 
+        time.sleep(0.1)
+    youbotenv.MoveArm(myname_bare,hole_search_config) 
+    time.sleep(2.0)
+    #raw_input('Hit Enter to go into hole.')
+
+def LiftTool2():
+    global youbotenv
+    global myname_bare
+    global hole_search_config
+    youbotenv.MoveHandStraight(myname_bare,direction=np.array([0.,0.,1.]), distance=0.07,step_size=0.005)
+    youbotenv.MoveHandStraight(myname_bare,direction=np.array([0.,0.,1.]), distance=0.10,step_size=0.01)
+    youbotenv.MoveArm(myname_bare,hole_search_config) 
+    time.sleep(2.0)
+
+def Insert2(insertion_hole):
+    global youbotenv
+    global myname_bare
+    global yik
+    clecotip_x = 0.085
+    insertion_start_height = 0.47 # the height of the hand before insertion.
+    backup = insertion_hole.position.x - clecotip_x 
+    r=youbotenv.GetRobot(myname_bare)
+    ee=r.GetManipulators()[0].GetEndEffectorTransform()
+    ee[0,3] = ee[0,3] + backup
+    ee[2,3] = insertion_start_height 
+    with r:
+        solns = yik.FindIKSolutions(r,ee)
+    if solns is None or len(solns) == 0:
+        print "Warning: No IK solution to move arm to insertion start point."
+        return
+    youbotenv.MoveArm(myname_bare,solns[0]) 
+    time.sleep(2.0)
+    youbotenv.MoveHandStraight(myname_bare,direction=np.array([0.,0.,-1.]), distance=0.07,step_size=0.002)
+    return
+
+def Insert(insertion_hole, angle):
+    service_switch(SwitchRequest(skin=False)) # Move drc4
+    #clecotip_pos = GetClecoTipPosition()
+    #print 'got cleco_pos: ', clecotip_pos
+    #print 'Moving to bring hole under cleco.'
+    #pose_to_transform = PoseStamped()
+    #if not insertion_hole.found:
+    #    print 'Hole not seen currently, but will still attempt to insert.'
+    #    dist = -clecotip_pos[0]
+    #    pose_to_transform.pose.position.x = -1* (-clecotip_pos[0])
+    #else:
+    #     dist = (insertion_hole.position.x - clecotip_pos[0])
+    #     pose_to_transform.pose.position.z = -1 * (-clecotip_pos[0])
+    #global my_name
+    #frame_id = my_name[:-1] + '_arm'
+    #pose_to_transform.header.frame_id = frame_id #TODO: un-hardcode this
+    #dest = transform_by_subjects(pose_to_transform, '/ladder')
+    #start_transform = PoseStamped()
+
+    #start_transform.header.frame_id = frame_id
+    #start = transform_by_subjects(start_transform, '/ladder')
+    #print start
+    #print dest
+    #
+    ##MoveRobotTo_robot_relative((dist,
+    ##                            0.0,
+    ##                            0.0),
+    ##                           fine_velocity)
+
+    #x = dest.pose.position.x
+    #y = dest.pose.position.y
+    ##TODO: get theta somehow
+    #euler = tr.euler_from_quaternion(np.array([dest.pose.orientation.x, dest.pose.orientation.y, dest.pose.orientation.z, dest.pose.orientation.w]))
+    #theta = euler[2] #just the yaw
+    #threshold = 0.002
+    #angle_threshold = 0.05
+    #arm_offset = False
+    #frame = '/ladder'
+
+    ##TODO: make this angle hole dependent
+    #arm_feedback(x, y, float(angle.data), threshold, angle_threshold, arm_offset, frame)
+    #
+    #sleeptime = (abs(dist)/fine_velocity)+2.0
+    #time.sleep(sleeptime)
+    ## Also move left
+    #moveleft_dist = -clecotip_pos[1]
+    #moveleft_vel = fine_velocity/2.0
+    #MoveRobotTo_robot_relative((0.0,
+    #                            0.0,
+    #                            0.0),
+    #                           moveleft_vel)
+    #sleeptime = (abs(moveleft_dist)/moveleft_vel)+2.0
+    #time.sleep(sleeptime)
+    print 'Moving cleco down.'
+    insertion_depth = -0.01 # FIXME for now not inserting but moving 1cm higher
+    #MoveClecoDown(length=abs(insertion_hole.position.y)+insertion_depth-abs(clecotip_pos[1]))
+    MoveClecoDown(0.)
+    return
+
+# Returns the cleco tip in the hokuyo frame /laser
+def GetClecoTipPosition():
+    # FIXME This should prbably do some point cloud processing 
+    # instead of fixed values. But if we calibrate, we can also
+    # use fixed values.
+    #cleco_tip_x = rospy.get_param("~cleco_tip_in_hokuyo_x", 0.07)
+    cleco_tip_x = rospy.get_param("~cleco_tip_in_hokuyo_x", 0.072)
+    #cleco_tip_x = rospy.get_param("~cleco_tip_in_hokuyo_x", 0.055)
+    #cleco_tip_y = rospy.get_param("~cleco_tip_in_hokuyo_y", -0.115)
+    cleco_tip_y = rospy.get_param("~cleco_tip_in_hokuyo_y", -0.16)
+    return np.array([cleco_tip_x - 0.015 ,cleco_tip_y - + 0.01])
+
+
+def MoveClecoDown(length):
+    global robot
+    global youbotenv
+    traj = orpy.RaveCreateTrajectory(youbotenv.env,"")
+    with open(hole_insertion_traj,'r') as fh:
+        trajstr = fh.read()
+    traj.deserialize(trajstr)
+    desc = traj.GetDescription()
+    eestep = float(desc.split(' ')[1])
+    aboveplate = int(np.ceil(0.06/eestep))
+    inhole = aboveplate + int(np.ceil(0.075/eestep))
+    youbotenv.MoveArm(robot.GetName(),traj.GetWaypoint(aboveplate)[:5]) 
+    time.sleep(2.0)
+    #raw_input('Hit Enter to go into hole.')
+    youbotenv.ExecuteTrajectory(robot.GetName(),traj,aboveplate+1,inhole) 
+
+    #youbotenv.ExecuteTrajectory(robot.GetName(),traj,0,int(np.ceil(0.02/eestep))) 
+    
+    #eepose = robot.GetManipulators()[0].GetEndEffectorTransform()
+    #eepose[2,3] = eepose[2,3] - length
+    #with robot:
+    #    base_poses,arm_configs = yik.FindIKAndBaseSolutions(robot,eepose)
+    ##IPython.embed()
+    #if base_poses is not None and len(base_poses) > 0:
+    #    base_soln=None
+    #    arm_config=None
+    #    for bp,ac in izip(base_poses,arm_configs):
+    #        #if abs(np.arctan2(bp[1,0],bp[0,0])) < 0.000001: # we want solns where the base is not rotated
+    #        if abs(ac[0]) < 0.000001: # we want solns where the base is not rotated
+    #            base_soln = bp
+    #            arm_config = ac
+    #            break
+    #    if base_soln is not None:
+    #        step((base_soln[0,3]*np.cos(start_loc.angular.z),base_soln[0,3]*np.sin(start_loc.angular.z),0.0),
+    #             coarse_velocity*3.0)
+    #        print 'moving arm'
+    #        youbotenv.MoveArm(robot.GetName(),arm_config) 
+    #        time.sleep(5.0)
+    #    else:
+    #        print 'Cannot find IK solution with base looking forward.'
+    #else:
+    #    print 'Cannot find IK solution.'
+
+
+#def Align(fixed_hole, moving_hole):
+#    diff = fixed_hole.position.x - moving_hole.position.x
+#    global position_lock
+#    position_lock.acquire()
+#    cur = copy.copy(position)
+#    position_lock.release()
+#    cur[0] = cur[0] + diff # FIXME what is the +x direction of hokuyo in the skin frame?
+#    MoveRobotTo(cur,fine_velocity)
+#    time.sleep((diff/fine_velocity) + 1.0)
+#    return True
+
+
+def insert_wrapper(req):
+    print 'In insert_wrapper'
+    #if not req.hole.found:
+    #    print 'Hole is not found yet. Cannot insert'
+    #    return False
+    Insert(req.hole, req.angle)
+    #Insert2(req.hole)
+    return True
+
+def lifttool_wrapper(req):
+    print 'In lifttool_wrapper'
+    LiftTool()
+    #LiftTool2()
+    return True
+
+
+def search_wrapper(req):
+    current_hole = Search(req.hole_name)
+    #if 'ladder' in req.hole_name:
+    #    current_hole = SearchHoleWithArm(req.hole_name)
+    #else:
+    #    current_hole = Search(req.hole_name)
+    if current_hole is None:
+        return SearchHoleResponse(hole=Hole(found=False,width=-1.0,position=Point(x=-1.0,y=-1.0,z=-1.0)))
+    return current_hole
+
+
+#def align_wrapper(req):
+#    return AlignHolesResponse(success=Align(req.fixed_hole,req.moving_hole))
+
+
+if __name__ == "__main__":
+
+    rospy.init_node('search')
+    my_name = rospy.get_namespace()
+    if my_name is '/':
+        my_name = '/drc4/'
+
+    rospy.Subscriber(my_name + 'location', Twist, set_position)
+    service_switch = rospy.ServiceProxy('/switch', Switch)
+    if not simulation:
+        # wait for a position message
+        while not rospy.is_shutdown():
+            try:
+                position_lock.acquire()
+                if got_position:
+                    break
+            finally:
+                position_lock.release()
+ 
+    pub_search = rospy.Publisher(my_name+'ik_command_fine', VelTwist)
+    rospy.Subscriber('/drc4/hole_found', Hole, hole_found)
+    hole_insertion_traj = rospy.get_param('hole_insertion_traj', '/home/drl-mocap/ros_stacks/drl-youbot/fleet_control/data/holeinsertion.traj.xml')
+
+    search_s = rospy.Service(my_name + 'start_search', SearchHole, search_wrapper)
+    insert_s = rospy.Service(my_name + 'insert', InsertToHole, insert_wrapper)
+    lifttool_s = rospy.Service(my_name + 'lifttool', InsertToHole, lifttool_wrapper)
+    #align_s = rospy.Service(my_name + 'align', AlignHoles, align_wrapper)
+    
+    rospy.wait_for_service('/drc4/hole_detection/parametrize')
+    try:
+        hole_detection_parametrization = rospy.ServiceProxy('/drc4/hole_detection/parametrize', HoleDetectionParametrization)
+    except rospy.ServiceException, e:
+        print "Service call failed: %s"%e
+
+    myname_bare = re.sub('/','',my_name) # strip off the slashes.
+    youbotenv = YoubotEnv(sim=False,viewer=False,env_xml=None,youbot_names=[myname_bare])
+    robot = youbotenv.youbots[myname_bare]
+    yik.init(robot)
+
+    time.sleep(2.0)
+    #youbotenv.MoveArm(myname_bare,[-5.37217726e-06,   4.93790417e-02,   5.06854451e-01, 9.13773345e-01,   6.71562387e-06])
+    hole_search_config = np.array([-3.25292222e-06,   4.94996471e-01,   1.46248718e-01, 8.28759765e-01,   6.92886286e-06])
+    youbotenv.MoveArm(myname_bare,hole_search_config)
+    time.sleep(1.0)
+
+    #TODO: don't hardcode this in the future
+    arm_feedback = rospy.ServiceProxy('/drc4/arm_feedback_command', BasePose)
+
+    rospy.spin()
+

@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<launch>
+	<node name="joy" pkg="joy" type="joy_node" />
+
+	<node name="fleet_master" pkg="fleet_control"
+              type="fleet_master.py" output="screen" />
+
+	<node name="multi_robot_joy" pkg="fleet_control"
+	      args="drc3 drc4"
+	      type="multi_robot_joy.py" output="screen" />
+
+	<group ns="drc3">
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller.py" output="screen" />
+
+                <node name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="screen" />
+	</group>
+
+	<group ns="drc4">
+		<node name="fleet_controller" pkg="fleet_control"
+                      type="fleet_controller.py" output="screen" />
+
+                <node name="mini_cartesian" pkg="robot"  type="mini_cartesian.py" output="screen" />
+	</group>
+</launch>

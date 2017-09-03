@@ -1,0 +1,36 @@
+#!/usr/bin/env python
+
+## This node directs two robots transporting a wing skin from a start to
+## a goal location.  The start location is on a rack, and the goal is
+## mounted on the wing ladder.
+
+import roslib; roslib.load_manifest('fleet_control')
+from std_msgs.msg import String
+import rospy
+import sys
+import os
+import subprocess
+from espeak import espeak
+
+def speak(msg):
+    text = msg.data
+    #print text
+    #espeak.set_parameter(1, 130)
+    #p = espeak.synth(text)
+    call = 'espeak -ven-us+m7 -s 130 "'+text+'"'
+    print call
+    subprocess.call(call, shell=True)
+    
+
+
+
+my_name = rospy.get_namespace()
+
+speech_topic = my_name + 'text_to_speech_male'
+rospy.Subscriber(speech_topic, String, speak)
+
+rospy.init_node('text_to_speech_male')
+
+espeak.list_voices()
+
+rospy.spin()

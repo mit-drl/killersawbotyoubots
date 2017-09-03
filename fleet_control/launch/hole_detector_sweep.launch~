@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<launch>
+
+        <machine name="drc4" address="drc4" user="youbot" timeout="30" 
+                 env-loader="/home/youbot/rosenv.sh" />
+                 
+    <!--TODO: Add parameters for the hole detector-->
+    <group ns="drc4">
+        <node name="hokuyo" pkg="hokuyo_node" type="hokuyo_node" 
+            respawn="false" output="screen" machine="drc4">
+  
+            <!-- Starts up faster, but timestamps will be inaccurate. --> 
+            <param name="calibrate_time" type="bool" value="false"/> 
+            
+            <!-- Set the port to connect to here -->
+            <param name="port" type="string" value="/dev/ttyACM0"/> 
+          
+            <param name="intensity" type="bool" value="false"/>
+        </node>
+
+        <node name="hole_detection" pkg="hole_detection" 
+            type="hole_detection.py" output="screen"/>
+            
+        <!--TODO: add a certain load file?-->
+        <!--node name="rviz" pkg="rviz" type="rviz" output="screen"/-->
+
+	    <node name="cmd_youbot_pos" pkg="fleet_control" 
+	        type="cmd_youbot_pos.py" output="screen" args="$(find fleet_control)/openrave/models" />
+	        
+	    <node name="searchsweep" pkg="fleet_control" 
+	        type="searchsweep.py" output="screen" />
+    </group>
+
+
+</launch>

@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+
+## This node coordinates the action of all robots in the fleet.
+
+import roslib; roslib.load_manifest('fleet_control')
+from geometry_msgs.msg import Twist,PoseStamped,Pose
+from fleet_control.msg import Fleet
+from std_msgs.msg import String
+from vicon_utils import *
+import rospy
+import numpy as np
+import math
+
+
+robots = list()
+set_fleet_pub = list()
+multi_cmd_pub = list()
+transform_origin_pub = list()
+fleet_origin_sub = list()
+
+fleet_origin = dict()
+origin_fuser = None
+
+
+def handle_cmd_vel(msg):
+    for mcp in multi_cmd_pub:
+        mcp.publish(msg)
+
+
+def handle_transform(msg):
+    """Adjust the origin of the motion frame.  If the frame_id is empty,
+       perform a relative frame update.  Otherwise, perform an absolute
+       adjustment of the frame with respect to frame_id."""
+    for top in transform_origin_pub:
+        top.publish(msg)
+
+
+def broadcast_to_fleet(msg):
+    for sfp in set_fleet_pub:
+        sfp.publish(msg)
+
+
+class Callback:
+    def __init__(self, robot):
+        self.robot = robot
+        self.origin = None
+
+    def callback(self, msg):
+        self.origin = msg
+        origin_fuser.fuse()
+        origin_fuser.publish()
+
+
+class OriginFuser:
+    def __init__(self, robots):
+        self.robots = robots
+        self.origin = None
+        self.callback = dict()
+        for rr in robots:
+            self.callback[rr] = Callback(rr)
+
+    def GetAverageYaw(self,yaws):
+        if (len(yaws) == 0):
+            print 'Why is yaws length 0?'
+            return math.atan2(0.0, 0.0) #Corner case
+        y_sum = 0.
+        x_sum = 0.
+        for yaw in yaws:
+          y_sum += math.sin(yaw) 
+          x_sum += math.cos(yaw) 
+        y_mean = y_sum/len(yaws)
+        x_mean = x_sum/len(yaws)
+        return math.atan2(y_mean,x_mean)
+
+        
+    def fuse(self):
+        origin = Pose()
+        yaws = []
+        for cb in self.callback:
+            item = self.callback[cb].origin
+            if item is None:
+                continue
+            origin.position.x += item.position.x
+            origin.position.y += item.position.y
+            origin.position.z += item.position.z
+            pose = geometry_pose_to_pose(item)
+            yaws.append(pose.get_yaw())
+
+        nn = len(self.callback)
+        if nn == 0:
+            return # Just turned off fleet
+        origin.position.x /= nn
+        origin.position.y /= nn
+        origin.position.z /= nn
+        yaw = self.GetAverageYaw(yaws)
+        qt = Quaternion.new_rotate_euler(0.0, yaw, 0.0)
+        origin.orientation.x = qt.x
+        origin.orientation.y = qt.y
+        origin.orientation.z = qt.z
+        origin.orientation.w = qt.w
+
+        self.origin = origin
+
+    def publish(self):
+        if self.origin is not None:
+            pose_pub.publish(self.origin)
+
+
+#def handle_fleet_origin(msg):
+    #global fleet_origin
+    #fleet_origin[robot] = msg
+
+    # TODO: this should fuse data from all robots
+    #pose_pub.publish(msg)
+
+
+def handle_set_fleet(msg):
+    global robots, set_fleet_pub, multi_cmd_pub, transform_origin_pub, fleet_origin_sub, origin_fuser
+
+    if len(robots) > 0:
+        # Need to cancel old fleet first
+        empty = Fleet()
+        broadcast_to_fleet(empty)
+
+    robots = [ name for name in msg.group ]
+    origin_fuser = OriginFuser(robots)
+    set_fleet_pub = list()
+    multi_cmd_pub = list()
+    transform_origin_pub = list()
+    fleet_origin_sub = list()
+    for rr in robots:
+        prefix = '/' + rr + '/'
+        set_fleet_topic = prefix + 'set_fleet'
+        multi_cmd_topic = prefix + 'multi_cmd'
+        transform_origin_topic = prefix + 'transform_origin'
+        fleet_origin_topic = prefix + 'fleet_origin'
+        set_fleet_pub.append(rospy.Publisher(set_fleet_topic, Fleet, latch=True))
+        multi_cmd_pub.append(rospy.Publisher(multi_cmd_topic, Twist, latch=True))
+        transform_origin_pub.append(rospy.Publisher(transform_origin_topic,
+                                                    PoseStamped, latch=True))
+        fleet_origin_sub.append(rospy.Subscriber(fleet_origin_topic, Pose,
+                                                 origin_fuser.callback[rr].callback))
+
+    broadcast_to_fleet(msg)
+
+
+rospy.init_node('fleet_master')
+
+pose_pub = rospy.Publisher('/fleet_origin', Pose)
+
+cmd_sub = rospy.Subscriber('/multi_cmd', Twist, handle_cmd_vel)
+
+trans_sub = rospy.Subscriber('/transform_origin', PoseStamped,
+                             handle_transform)
+
+sub = rospy.Subscriber('/set_fleet', Fleet, handle_set_fleet)
+
+rospy.spin()
+

@@ -1,0 +1,144 @@
+#!/usr/bin/env python
+
+import roslib; roslib.load_manifest('fleet_control')
+import rospy
+import yaml
+import math
+import re
+from mit_msgs.msg import MocapPositionArray, MocapPosition
+import geometry_msgs.msg
+from geometry_msgs.msg import Twist,Pose
+from assembly_common.srv import BasePose,ArmCommand,AttachObject
+from std_msgs.msg import String
+from euclid import *
+import IPython
+
+class TwoRobotLackTable:
+
+    robots_to_held_objects = {}
+    leg_pos = None
+    
+    def set_leg_pose(msg):
+        self.leg_pose = msg
+
+    def __init__(self):
+        self.cmd_vel = rospy.Publisher('/drc1/cmd_vel', Twist)
+        self.arm_command = rospy.ServiceProxy('/drc1/robot_arm_command', ArmCommand)
+        self.arm_feedback = rospy.ServiceProxy('/drc1/arm_feedback_command', BasePose)
+        self.leg_navigate_pose = Pose3().new_pose(Point3(0.0, -0.3, 0.0),
+                          Quaternion.new_rotate_euler(0.0, 0.5 * math.pi, 0.0))
+        self.base_command = rospy.ServiceProxy('/drc1/robot_base_command', BasePose)
+        
+        self.pickup_accuracy = rospy.get_param('/pickup_accuracy')
+        self.assembly_accuracy = rospy.get_param('/assembly_accuracy')
+        self.source_accuracy = rospy.get_param('/source_accuracy')
+        #self.leg_pose_sub = rospy.Subscriber('/black_leg_2', MocapPosition, set_leg_pos)
+
+    
+    
+    def get_robot_idx(self, robot):
+        print "robot: %s" % robot
+        match = re.search('[0-9]+', robot)
+        return int(robot[match.start():match.end()])
+
+    def set_status(self, msg):
+        print msg
+        
+    def back_off(self, idx, seconds):
+        cmd = Twist()
+        cmd.linear.x = -0.1
+
+        self.cmd_vel.publish(cmd)
+        rospy.sleep(seconds)
+        self.cmd_vel.publish(Twist())
+        
+    def arm_command_wrapper(self, robot, arm_position):
+        success = False
+        while not success and not rospy.is_shutdown():
+            success = True
+            try:
+                self.arm_command(arm_position)
+            except Exception as e:
+                success = False
+                rospy.logerr("Arm command threw an exception. Trying again...");
+                print e
+                rospy.sleep(0.5)
+                
+    def arm_feedback_wrapper(self, idx, xx, yy, theta, pos_acc, ang_acc,
+                             offset, frame):
+        print "\tarm_feedback[%d](%f, %f, %f, %f, %f, %f, %s)" % (idx, xx, yy, theta + math.pi,
+                                                          pos_acc, ang_acc, offset, frame)
+        self.arm_feedback(xx, yy, theta, pos_acc, ang_acc, offset, frame)
+
+
+
+
+    def pick_up_leg(self, robot, leg):
+            self.leg_pickup_pose = Pose3().new_pose(Point3(0.005, 0.002, 0.0),
+                          Quaternion.new_rotate_euler(0.0, 0.5 * math.pi, 0.0))
+            idx = self.get_robot_idx(robot)
+            #vicon_leg_name = self.vicon.translate_abpl_to_viconesque(leg)
+            vicon_leg_name = leg
+            print "step pick_up_leg(%s, %s)" % (robot, leg)
+            pose = self.leg_pickup_pose
+            xx, yy, theta = pose.trans.x, pose.trans.y, pose.get_yaw()
+            print '\tpart %s pose: %f, %f, %f' % (leg, xx, yy, theta)
+
+
+            # 1) Configure arm preshape for pickup
+            print "\tarm_command_wrapper(%d, %s)" % (idx, 'pick_up_step1')
+            self.arm_command_wrapper(idx, 'pick_up_step1')
+
+            # 2) fine tune position over part (assume we're close)
+            self.arm_feedback_wrapper(idx, xx, yy, theta, self.source_accuracy[2], self.source_accuracy[3], False, vicon_leg_name)
+
+            # 3) pick up part (drop, grasp, and raise)
+            print "\tarm_command_wrapper(%d, %s)" % (idx, 'drop_arm')
+            self.arm_command_wrapper(idx, 'drop_arm')
+            self.set_status('picking up new part')
+            print "\tarm_command_wrapper(%d, %s)" % (idx, 'raise_arm')
+            self.arm_command_wrapper(idx, 'raise_arm')
+
+            # 4) Transporting the part in a vertical configuration for balance
+            print "\tarm_command_wrapper(%d, %s)" % (idx, 'pick_up_step2')
+            self.arm_command_wrapper(idx, 'pick_up_step2')
+            print "\tarm_command_wrapper(%d, %s)" % (idx, 'pick_up_step3')
+            self.arm_command_wrapper(idx, 'pick_up_step3')
+            
+    def navigate_to_part(self, robot, part):
+        print "step navigate_to_part(%s, %s)" % (robot, part)
+        #pose = self.vicon._abpl_part_to_pose(part)
+        #print 'part pose: %s   PYR: %s' % (pose, pose.rot.get_euler())
+        pose = self.leg_navigate_pose
+        print 'target pose: %s   PYR: %s' % (pose, pose.rot.get_euler())
+        xx, yy, theta = pose.trans.x, pose.trans.y, pose.get_yaw()
+        self.navigate(robot, xx, yy, theta, self.pickup_accuracy[0]*2,
+                      self.pickup_accuracy[1], True, "/" + part)
+                      
+    def navigate(self, robot, xx, yy, theta, pos_accuracy, rot_accuracy,
+                 arm_offset, frame):
+        idx = self.get_robot_idx(robot)
+        print "step navigate(%s=robot %d, %s, %s)" % (robot, idx, (xx, yy, theta), frame)
+        completed = self.base_command_wrapper(idx, xx, yy, theta,
+                                           self.assembly_accuracy[0],
+                                           self.assembly_accuracy[1], True,
+                                           frame)
+                                           
+    def base_command_wrapper(self, idx, xx, yy, theta, pos_acc, ang_acc,
+                             offset, frame):
+        print "\tbase_command[%d](%f, %f, %f, %f, %f [%s])" % (idx, xx, yy,
+                                                          theta, pos_acc,
+                                                          ang_acc, frame)
+
+        return self.base_command(xx, yy, theta, pos_acc, ang_acc,
+                                      offset, frame)
+                                      
+rospy.init_node('pick_up')
+'''
+state = StateTracker()
+verifier = ViconChecker(state)
+verifier.update_state_from_vicon()
+'''
+trlt = TwoRobotLackTable()
+trlt.navigate_to_part('drc1', 'black_leg_2')
+trlt.pick_up_leg('drc1', 'black_leg_2')

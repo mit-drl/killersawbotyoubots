@@ -1,0 +1,11 @@
+1: S
+2: S
+3: s/f 1st hole succeeded but arm j4 died right after first hole insertion..? (increased back away speed, bringing panel lower after first insertion)
+4: S (bringin panel higher after 1st insertion)
+5: S* (4th hole stuck)
+6: S
+7: S* (4th hole stuck)
+8: S
+9: S* (4th hole stuck) Reduced goal width for hole 3
+10: 
+

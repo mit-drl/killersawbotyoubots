@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<launch>
+	<node name="joy" pkg="joy" type="joy_node" />
+
+	<node name="multi_robot_joy" pkg="fleet_control"
+	      args="drc1 drc3"
+	      type="multi_robot_joy.py" output="screen" />
+</launch>
