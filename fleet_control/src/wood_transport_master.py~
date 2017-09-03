@@ -154,10 +154,12 @@ def regrasp(dist_back_x, min_dist):
     
     print abs(drc1_new_pos[0] - midpoint[0])
     if abs(drc1_new_pos[0] - midpoint[0]) < min_dist:
+        print 'adjust 1'
         drc1_new_pos[0] = midpoint[0] - min_dist
     
     print abs(drc3_new_pos[0] - midpoint[0])
     if abs(drc3_new_pos[0] - midpoint[0]) < min_dist:
+        print 'adjust 3'
         drc3_new_pos[0] = midpoint[0] + min_dist
         
     

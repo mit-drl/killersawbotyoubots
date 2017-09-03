@@ -240,6 +240,19 @@ def handle_fleet_origin(msg):
     
 def multi_cmd_fleet(msg):
     fleet_vel.publish(msg)
+    
+def arm_command_wrapper(arm_position):
+    success = False
+    while not success:
+        btime = time.time()
+        success = True
+        try:
+            arm_command(arm_position)
+        except Exception:
+            success = False
+            print ("Arm command %s threw an exception. Trying again..."
+                         % arm_position);
+            rospy.sleep(0.5)
 
 
 
@@ -250,38 +263,54 @@ fleet_origin_topic  = '/fleet_origin'
 base_service1 = '/drc1/robot_base_command'
 base_service3 = '/drc3/robot_base_command'
 
+arm_service1 = '/drc1/robot_arm_command'
+arm_service3 = '/drc3/robot_arm_command'
+
 
 fleet_vel = rospy.Publisher(fleet_vel_topic, Twist, latch=False)
 fleet_origin_sub = rospy.Subscriber(fleet_origin_topic, Pose, handle_fleet_origin)
 
-rospy.wait_for_service('/drc1/robot_base_command')
-rospy.wait_for_service('/drc3/robot_base_command')
+rospy.wait_for_service(base_service1)
+rospy.wait_for_service(base_service3)
+rospy.wait_for_service(arm_service1)
+rospy.wait_for_service(arm_service3)
 
 
 base_command1 = rospy.ServiceProxy(base_service1, BasePose)
 print 'base_service1 available'
 base_command3 = rospy.ServiceProxy(base_service3, BasePose)
 print 'base_service3 available'
+arm_command1 = rospy.ServiceProxy(arm_service1, ArmCommand)
+print 'arm service 1 available'
+arm_command3 = rospy.ServiceProxy(arm_service3, ArmCommand)
+print 'arm service 3 available'
 
 
 
-
-
-
+#Step 1: arm position
 
 
 rospy.sleep(1.0)
+#Step 2: youbot location
 
-#Step 0: Create fleet cormation
-print 'go #1'
-#base_command1(0.7, 0.45, -math.pi, 0.1, 0.1, False, "/woodmount1")
-print 'done'
-#base_command3(0.7, -0.45, -math.pi, 0.1, 0.1, False, "/woodmount2")
+
+print 'time to get into position'
+
+arm_command1('post_grab_lumber')
+print 'arm 1 done'
+arm_command3('post_grab_lumber')
+print 'arm 3 done'
+
+base_command1(0.0, 0.45, -math.pi, 0.1, 0.1, False, "/woodmount1")
+base_command3(0.0, -0.45, -math.pi, 0.1, 0.1, False, "/woodmount2")
+
+arm_command1('pre_grab_lumber')
+arm_command3('pre_grab_lumber')
 
 print 'done moving bases'
 
 
-#Step 2: set fleet
+#Step 3: set fleet
 set_fleet = rospy.Publisher('/set_fleet', Fleet, latch=True)
 
 
@@ -292,7 +321,7 @@ wait_for_subscriber(set_fleet)
 print fleet
 set_fleet.publish(fleet) #Step 1
 
-#Step 3: move fleet to waypoints
+#Step 4: move to saw
 
 pose = Pose()
 
@@ -320,22 +349,28 @@ rospy.sleep(2.0)
 
 raw_input('hello')
 print 'servo fleet time'
-
-#servo_fleet(pose, frame, lin_vel, ang_vel) #Step 2
-
-
-#Step 3: break the fleet:
+arm_command1('saw_pose')
+arm_command3('saw_pose')
+servo_fleet(pose, frame, lin_vel, ang_vel) #Step 2
 
 fleet = Fleet()
 print fleet
 set_fleet.publish(fleet)
 
+#Step 6: regrasp
+
 safety_thresh = 0.9
 raw_input('are you ready?')
 regrasp(back_amt, safety_thresh) #backward amount, safety threshold
 
+raw_input('sawwww')
+#Step 5: break the fleet:
+
+
+
 print 'done moving everything'
-    
+arm_command1('post_grab_lumber')
+arm_command3('post_grab_lumber')
 
 
 
