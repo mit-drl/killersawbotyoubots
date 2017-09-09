@@ -7,7 +7,7 @@ from assembly_common.msg import CommunicationStamped, Communication
 from mit_msgs.msg import MocapPositionArray
 from fleet_control.msg import Fleet, FleetCommand
 #from fleet_control.srv import CheckSuccess
-from std_msgs.msg import String,Float64, Header, Time
+from std_msgs.msg import String,Float64, Header, Time, Int32, Float32
 #from brics_actuator.msg import JointVelocities
 from visualization_msgs.msg import Marker
 import euclid
@@ -17,6 +17,11 @@ import math
 import numpy as np
 import string
 import IPython
+
+from youbotpy import YoubotEnv
+import openravepy as orpy
+from youbotpy import youbotik as yik
+from brics_actuator.msg import JointVelocities, JointValue, JointPositions
 
 import sys
 import subprocess
@@ -32,8 +37,73 @@ robot_names = ['drc1', 'drc3']
 
 fleet_origin = None
 
+wood_correction = 0.130175
+MAX_VEL = 0.4
+
+arm_names = []
+for i in range(5):
+    arm_names.append('arm_joint_' + str(i + 1))
+    
+unit = 's^-1 rad'
 
 
+def createVelocity(vels):
+    for i in range(len(vels)):
+        vels[i] = float(vels[i])
+    vels = np.array(vels)
+    #clamp
+    if np.linalg.norm(vels, 2) > MAX_VEL:
+        vels /= np.linalg.norm(vels, 2)
+        vels *=  MAX_VEL
+    
+    v = JointVelocities()
+    for i in range(5):
+        v.velocities.append(JointValue())
+        v.velocities[i].joint_uri = arm_names[i]
+        v.velocities[i].unit = unit
+        v.velocities[i].value = float(vels[i])
+    return v
+    
+def stop():
+    v = createVelocity([0, 0, 0, 0, 0])
+    vel_pub1.publish(v)
+    vel_pub3.publish(v)
+    
+def move(vel):
+    v = createVelocity(vel)
+    vel_pub1.publish(v)
+    vel_pub3.publish(v)
+
+'''
+coarse_velocity = 0.006
+
+fine_velocity = 0.005
+MAX_VEL = 0.4
+THRESH = 0.003
+
+simulation = True
+position = np.array([0.0,0.0,0.0])
+
+arm_names = []
+for i in range(5):
+    arm_names.append('arm_joint_' + str(i + 1))
+    
+unit = 's^-1 rad'
+
+all_robot_names = ['drc1', 'drc3']
+r = all_robot_names[0]
+envfile = 'environments/floor.env.xml'
+
+offset = np.array([2.950, 1.1345, -2.5482, 1.7890, 2.9234])
+
+def stop():
+    v = createVelocity([0, 0, 0, 0, 0])
+    vel_pub.publish(v)
+
+def getEndEffector():
+    return youbots[r].GetManipulators()[0].GetEndEffectorTransform()
+
+'''
 
 
 def wait_for_subscriber(pub):
@@ -105,6 +175,54 @@ def get_multi_vel(error, max_vel, gain):
     #sys.stdout.write("\n")
 
     return out
+    
+    
+def final_adjustment(dist_back_x):
+    #step 1: get the poses in the world frame\
+    print 'drc1'
+    drc1 = vicon_to_geometry_pose('drc1')
+    print 'drc3'
+    drc3 = vicon_to_geometry_pose('drc3')
+
+    
+    midpoint_vicon = vicon_to_geometry_pose('killer_death_sawbot')
+    
+    midpoint = np.array([midpoint_vicon.position.x, midpoint_vicon.position.y, midpoint_vicon.position.z])
+    
+
+    drc1_pos = drc1.position
+    drc3_pos = drc3.position
+    
+    drc1_pos_array = np.array([drc1_pos.x, drc1_pos.y, drc1_pos.z])
+    drc3_pos_array = np.array([drc3_pos.x, drc3_pos.y, drc3_pos.z])
+    
+    
+    #midpoint = (wood1_pos_array + wood2_pos_array) / 2.0
+    
+
+    
+    
+    
+    drc1_pose = geometry_pose_to_pose(drc1)
+    drc3_pose = geometry_pose_to_pose(drc3)
+    
+    drc1_yaw = drc1_pose.get_yaw()
+    drc3_yaw = drc3_pose.get_yaw()
+    
+    drc1_x = drc1_pos_array[0] + dist_back_x
+    drc3_x = drc3_pos_array[0] + dist_back_x
+    
+    drc1_y = drc1_pos_array[1]
+    drc3_y = drc3_pos_array[1]
+    
+        
+    
+    
+    
+    
+    base_command1(drc1_x, drc1_y, drc1_yaw, 0.025, 0.1, False, "/map")
+    base_command3(drc3_x, drc3_y, drc3_yaw, 0.025, 0.1, False, "/map")
+
 
 def regrasp(dist_back_x, min_dist):
     #step 1: get the poses in the world frame\
@@ -240,8 +358,52 @@ def handle_fleet_origin(msg):
     
 def multi_cmd_fleet(msg):
     fleet_vel.publish(msg)
+    
+def arm_command_wrapper(arm_position):
+    success = False
+    while not success:
+        btime = time.time()
+        success = True
+        try:
+            arm_command(arm_position)
+        except Exception:
+            success = False
+            print ("Arm command %s threw an exception. Trying again..."
+                         % arm_position);
+            rospy.sleep(0.5)
+            
+def move_wood(length):
+
+    
+
+    const = 1e3
+    thresh = 0.005
+    while True:
+        print 'move move move'
+        #step 1: get the poses in the world frame\
+        woodmount1 = vicon_to_geometry_pose('woodmount1')
+        midpoint_vicon = vicon_to_geometry_pose('killer_death_sawbot')
+        midpoint = np.array([midpoint_vicon.position.x, midpoint_vicon.position.y, midpoint_vicon.position.z])
+        wood1_pos = woodmount1.position
+        wood1_pos_array = np.array([wood1_pos.x, wood1_pos.y, wood1_pos.z])
+        
+        wood_length = np.linalg.norm(wood1_pos_array - midpoint)
+        
+        delta = (length - wood_length)
+        
+        arm1increment.publish(Float32(-1.0 * delta * const))
+        
+        
+        rospy.sleep(2.0)
+        
+        if abs(delta) < thresh:
+            return
+    
+    
+    
 
 
+debug_mode = False
 
 #Handle setup of ros topics and services:
 
@@ -250,57 +412,227 @@ fleet_origin_topic  = '/fleet_origin'
 base_service1 = '/drc1/robot_base_command'
 base_service3 = '/drc3/robot_base_command'
 
+arm_service1 = '/drc1/robot_arm_command'
+arm_service3 = '/drc3/robot_arm_command'
+
 
 fleet_vel = rospy.Publisher(fleet_vel_topic, Twist, latch=False)
 fleet_origin_sub = rospy.Subscriber(fleet_origin_topic, Pose, handle_fleet_origin)
 
-rospy.wait_for_service('/drc1/robot_base_command')
-rospy.wait_for_service('/drc3/robot_base_command')
+#JEFF INSTANTIATE PUBLISHER HERE
+arm1grab = rospy.Publisher("/drc1/drc1_oc", Int32, latch = False)
+arm1increment = rospy.Publisher("/drc1/drc1_i", Float32, latch = False)
+arm3grab = rospy.Publisher("/drc3/drc3_oc", Int32, latch = False)
+arm3increment = rospy.Publisher("/drc3/drc3_i", Float32, latch = False)
+
+vel_pub1 = rospy.Publisher('/drc1/arm_1/arm_controller/velocity_command', JointVelocities, queue_size=1)
+vel_pub3 = rospy.Publisher('/drc3/arm_1/arm_controller/velocity_command', JointVelocities, queue_size=1)
+
+grab_msg_1 = Int32()
+grab_msg_3 = Int32()
+grab_msg_1.data = 0
+grab_msg_3.data = 0
+arm1grab.publish(grab_msg_1)
+arm3grab.publish(grab_msg_3)
+
+print 'wait'
+
+rospy.wait_for_service(base_service1)
+rospy.wait_for_service(base_service3)
+rospy.wait_for_service(arm_service1)
+rospy.wait_for_service(arm_service3)
+
+print 'got it'
 
 
 base_command1 = rospy.ServiceProxy(base_service1, BasePose)
 print 'base_service1 available'
 base_command3 = rospy.ServiceProxy(base_service3, BasePose)
 print 'base_service3 available'
+arm_command1 = rospy.ServiceProxy(arm_service1, ArmCommand)
+print 'arm service 1 available'
+arm_command3 = rospy.ServiceProxy(arm_service3, ArmCommand)
+print 'arm service 3 available'
 
 
 
-
-
-
+#Step 1: arm position
 
 
 rospy.sleep(1.0)
-
-#Step 0: Create fleet cormation
-print 'go #1'
-#base_command1(0.7, 0.45, -math.pi, 0.1, 0.1, False, "/woodmount1")
-print 'done'
-#base_command3(0.7, -0.45, -math.pi, 0.1, 0.1, False, "/woodmount2")
-
-print 'done moving bases'
+#Step 2: youbot location
 
 
-#Step 2: set fleet
+print 'time to get into position'
+
+arm_command1('post_grab_lumber')
+print 'arm 1 done'
+arm_command3('post_grab_lumber')
+print 'arm 3 done'
+
+#raw_input('arms done - hit enter')
+
+if not debug_mode:
+    base_command1(0.435, 0.45, -math.pi, 0.005, 0.001, False, "/woodmount1")
+    base_command3(0.435, -0.45, -math.pi, 0.005, 0.001, False, "/woodmount2")
+
+    raw_input('bases done - hit enter?')
+
+    move([0.0, 0.1, -0.2, 0.1, 0.0])
+    rospy.sleep(5.0)
+    stop()
+    raw_input('done testing velocity')
+
+if not debug_mode:
+
+
+
+    arm_command1('pre_grab_lumber')
+    arm_command3('pre_grab_lumber')
+
+    raw_input('arms ready to grab - hit enter')
+    
+    
+
+#JEFF DO YOUR MAGIC HERE
+if not debug_mode:
+    grab_msg_1 = Int32()
+    grab_msg_3 = Int32()
+    grab_msg_1.data = 2
+    grab_msg_3.data = 2
+
+if not debug_mode:
+    arm1grab.publish(grab_msg_1)
+    arm3grab.publish(grab_msg_3)
+    
+    rospy.sleep(3.0)
+
+
+#Step 3: set fleet
 set_fleet = rospy.Publisher('/set_fleet', Fleet, latch=True)
 
 
+if not debug_mode:
+    fleet = Fleet()
+    fleet.group.extend(robot_names)
+    wait_for_subscriber(set_fleet)
+    print fleet
+    set_fleet.publish(fleet) 
 
+#Step 4: move to saw
+if not debug_mode:
+    pose = Pose()
+
+
+    pose.orientation = Quaternion.new_rotate_euler(0.0, 0.0, 0.0)
+
+    back_amt = -0.39
+    pose.position.x = back_amt
+    pose.position.y = 0.0
+    pose.position.z = 0.0
+
+
+    frame = '/killer_death_sawbot'
+    lin_vel = 0.1
+    ang_vel = 0.2
+
+
+
+
+
+    print 'servo fleet time'
+    
+    pose0 = Pose()
+    pose.orientation = Quaternion.new_rotate_euler(0.0, 0.0, 0.0)
+
+    pos_x = 0.5
+    pose0.position.x = pos_x
+    pose0.position.y = 0.0
+    pose0.position.z = 0.0
+
+
+    frame = '/killer_death_sawbot'
+    lin_vel = 0.1
+    ang_vel = 0.2
+    
+    servo_fleet(pose0, frame, lin_vel, ang_vel) #Step 2
+    rospy.sleep(0.1)
+    arm_command1('grab_lumber')
+    arm_command3('grab_lumber')
+    rospy.sleep(0.1)
+    servo_fleet(pose, frame, lin_vel, ang_vel) #Step 2
+    arm_command1('saw_pose')
+    arm_command3('saw_pose')
+
+if not debug_mode:
+    fleet = Fleet()
+    print fleet
+    set_fleet.publish(fleet)
+
+#Step 6: regrasp
+if not debug_mode:
+    rospy.sleep(1.0)
+    grab_msg_1 = Int32()
+    grab_msg_3 = Int32()
+    grab_msg_1.data = 0
+    grab_msg_3.data = 0
+    arm1grab.publish(grab_msg_1)
+    arm3grab.publish(grab_msg_3)
+    safety_thresh = 0.9
+    raw_input('are you ready?')
+    regrasp(back_amt, safety_thresh) #backward amount, safety threshold
+
+
+if not debug_mode:
+    rospy.sleep(1.0)
+    grab_msg_1 = Int32()
+    grab_msg_3 = Int32()
+    grab_msg_1.data = 3
+    grab_msg_3.data = 0
+    arm1grab.publish(grab_msg_1)
+    arm3grab.publish(grab_msg_3)
+
+    raw_input('ready to move wood')
+    move_wood(1.0 - wood_correction)
+
+
+    #final adjustment
+    grab_msg_3 = Int32()
+    grab_msg_3.data = 3
+    arm3grab.publish(grab_msg_3)
+
+    rospy.sleep(1.0)
+    
+    grab_msg_1 = Int32()
+    grab_msg_1.data = 0
+    arm3grab.publish(grab_msg_1)
+
+    rospy.sleep(1.0)
+    
+    grab_msg_1 = Int32()
+    grab_msg_1.data = 3
+    arm3grab.publish(grab_msg_1)
+    
+    rospy.sleep(1.0)
+
+
+
+#final_adjustment(-0.01)
+
+"""
 fleet = Fleet()
 fleet.group.extend(robot_names)
 wait_for_subscriber(set_fleet)
 print fleet
-set_fleet.publish(fleet) #Step 1
+set_fleet.publish(fleet)
 
-#Step 3: move fleet to waypoints
+rospy.sleep(1.0)
 
 pose = Pose()
-
-
 pose.orientation = Quaternion.new_rotate_euler(0.0, 0.0, 0.0)
 
-back_amt = -0.3
-pose.position.x = back_amt
+pos_x = -0.38
+pose.position.x = pos_x
 pose.position.y = 0.0
 pose.position.z = 0.0
 
@@ -309,33 +641,18 @@ frame = '/killer_death_sawbot'
 lin_vel = 0.1
 ang_vel = 0.2
 
-rospy.sleep(2.0)
+servo_fleet(pose, frame, lin_vel, ang_vel)
+"""
 
 
-#print 'test linear velocity'
-#twist = Twist()
-#twist.linear.x = 0.01
-#twist.angular.z = 0.1
-#multi_cmd_fleet(twist)
-
-raw_input('hello')
-print 'servo fleet time'
-
-#servo_fleet(pose, frame, lin_vel, ang_vel) #Step 2
+raw_input('sawwww')
+#Step 5: break the fleet:
 
 
-#Step 3: break the fleet:
-
-fleet = Fleet()
-print fleet
-set_fleet.publish(fleet)
-
-safety_thresh = 0.9
-raw_input('are you ready?')
-regrasp(back_amt, safety_thresh) #backward amount, safety threshold
 
 print 'done moving everything'
-    
+arm_command1('post_grab_lumber')
+arm_command3('post_grab_lumber')
 
 
 
